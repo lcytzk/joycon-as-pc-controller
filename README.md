@@ -1,36 +1,32 @@
-# JoyMapperSilicon
-Nintendo Joy-Con / Pro Controller Mapper for Apple Silicon (also works on Intel-based macOS Big Sur). It maps gamepad buttons to keyboard / mouse events smoothly and works for games and platforms which haven't yet supported gamepad on M1 Macs, e.g., Witcher 3, CrossOver.
+# GyroKeyMapper
 
-## Demo on YouTube
+Nintendo Joy-Con / Pro Controller mapper for Apple Silicon and Intel Macs. Maps buttons, sticks, and gyro to keyboard and mouse events, so games and other apps that don't natively support a gamepad on macOS (e.g. Witcher 3, CrossOver) can still be played with one.
 
-[Apple Silicon Mac | CrossOver | Playing Witcher 3 with GAMEPAD (Nintendo Joy-Con / Pro Controller)
-](https://youtu.be/1jpcuREivmk)
+A Swift Package Manager app — no Xcode project, no CocoaPods. Building only needs the Swift toolchain.
 
-## Advantages v.s. alternatives
+## Features
 
-|                                                          | Big Sur | Apple silicon native | Mouse working in games | 360° mouse move & acceleration (smooth view angle rotation) | Joystick orientation at 45°s (smooth character moving) | Both Joy Cons as a pair |
-| :------------------------------------------------------: | :-----: | :------------------: | :--------------------: | :---------------------------------------------------------: | :----------------------------------------------------: | :---------------------: |
-|     [Enjoyable](https://yukkurigames.com/enjoyable/)     |    ✅    |          ❌           |           ✅            |                              ❌                              |                           ✅                            |            ❌            |
-|       [Enjoy2](https://github.com/fyhuang/enjoy2/)       |    ❌    |          ❌           |           -            |                              -                              |                           -                            |            -            |
-| [JoyKeyMapper](https://github.com/magicien/JoyKeyMapper) |    ✅    |          ❌           |           ❌            |                              ✅                              |                           ❌                            |            ✅            |
-|                 JoyMapperSilicon (this app)                  |    ✅    |          ✅           |           ✅            |                              ✅                              |                           ✅                            |            ✅            |
+- **Buttons**: map each button to a key (including "+"-separated combos like `cmd+tab`), a mouse click, or nothing.
+- **Sticks**: each stick independently drives mouse movement, a scroll wheel, four directional keys, or nothing.
+- **Gyro-to-mouse**: turns the controller's gyroscope into mouse movement — either always-on rate control, or a "laser pointer" mode anchored to wherever the cursor was when a hold-to-activate button went down. Sensitivity, axis mapping, inversion, and a responsive/steady smoothing tradeoff are all configurable.
+- Runs as a menu-bar-only background app (no Dock icon); Settings are a plain AppKit window built entirely in code.
 
-## Installation
+## Build & run
 
-1. Download the zip file (JoyMapperSilicon.app.zip) from [Releases](https://github.com/qibinc/JoyMapperSilicon/releases/)
+```sh
+cd GyroKeyMapper
+swift build
+./.build/debug/GyroKeyMapper
+```
 
-2. Copy JoyMapperSilicon.app to `Applications/` folder.
+For a release build, use `swift build -c release` and run `.build/release/GyroKeyMapper` instead.
 
-## Usage
+## Configuration
 
-![screenshot](https://github.com/qibinc/JoyMapperSilicon/blob/master/resources/screenshot/screenshot_1.png)
+Open Settings from the 🎮 menu-bar icon. Configuration is stored as JSON at `~/Library/Application Support/GyroKeyMapper/config.json` and is picked up on launch and whenever Settings is saved.
 
-See [magicien's How to Use](https://github.com/magicien/JoyKeyMapper#how-to-use).
-
-## Support the work
-
-[![Paypal Donate](https://img.shields.io/badge/paypal-donate-orange)](https://paypal.me/joysilicon) You can buy me a cup of bubble tea if you like it.
+To diagnose gyro connection stutter (report drops on the Bluetooth link vs. app-side stalls), run with `GYROKEYMAPPER_DEBUG=1` — it prints a sample-rate/gap summary to stdout every 2 seconds.
 
 ## Acknowledgement
 
-This application is heavily based on [magicien/JoyKeyMapper](https://github.com/magicien/JoyKeyMapper). We thank them a lot for open-sourcing the [JoyKeyMapper](https://apps.apple.com/us/app/joykeymapper/id1511416593?mt=12) app. Please also support them if possible.
+This application is based on [magicien/JoyKeyMapper](https://github.com/magicien/JoyKeyMapper) and [qibinc/JoyMapperSilicon](https://github.com/qibinc/JoyMapperSilicon), which ported it to Apple Silicon. `Sources/JoyConSwift` is vendored from [magicien/JoyConSwift](https://github.com/magicien/JoyConSwift) (MIT license) since it only ships a CocoaPods podspec, not a `Package.swift`. Thanks to both for open-sourcing their work.
