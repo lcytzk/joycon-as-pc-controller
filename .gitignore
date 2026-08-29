@@ -1,0 +1,23 @@
+.claude-env/
+.mcp.json
+.claude/*.lock
+.claude/settings.local.json
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode (in case a project gets opened/generated later)
+*.DS_Store
+build/
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData
+*.hmap
+*.ipa
+*.xcuserstate
+
+# etc
+*~
+*.swp

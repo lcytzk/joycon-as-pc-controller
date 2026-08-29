@@ -1,0 +1,26 @@
+[ccenv]
+schema_version = 1
+
+[skills]
+items = ["add-app", "grilling"]
+
+[agents]
+items = []
+
+[rules]
+items = []
+
+[output-styles]
+items = []
+
+[mcp]
+items = []
+
+[plugins]
+items = []
+
+[settings]
+items = []
+
+[kits]
+items = []
