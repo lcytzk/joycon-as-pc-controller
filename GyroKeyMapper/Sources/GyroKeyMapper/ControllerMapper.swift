@@ -319,6 +319,21 @@ final class ControllerMapper {
 
         guard let name = name else { return }
 
+        if diagnostics != nil {
+            // Answers the three questions that "FN doesn't work" could mean, in
+            // one line: is the pair even recognised, is the layer switched on,
+            // and is the key being held seen as an FN key at all.
+            let engaged = combine.fnEngagedKeys()
+            // stderr, not stdout: start.sh redirects both to the log, but
+            // stdout to a file is block-buffered and would show nothing until
+            // the process exits.
+            FileHandle.standardError.write(Data(("[fn] \(controller.type.rawValue) btn=\(name) down=\(isDown) "
+                + "combined=\(mapping.isCombined) fnEnabled=\(mapping.fn.enabled) "
+                + "fnKeys=\(mapping.fn.activeLayers.compactMap { $0.key }) "
+                + "isFnKey=\(mapping.fn.isFnKey(name)) held=\(engaged) "
+                + "-> \(String(describing: mapping.fn.action(for: name, base: mapping.buttons, engaged: engaged)))\n").utf8))
+        }
+
         // The FN key drives the shared layer state and emits nothing of its own
         // while held. Its ordinary binding fires on release, and only if the
         // release turned out to be a tap — by which time the button is already

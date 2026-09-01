@@ -103,7 +103,7 @@ enum StickMode: String, Codable {
 // build must still load, since a decode failure silently replaces the user's
 // whole setup with the defaults.
 
-struct StickConfig: Codable {
+struct StickConfig: Codable, Equatable {
     var mode: StickMode = .none
     var speed: Double = 10.0
     // Directions: "up", "down", "left", "right" — only used when mode == .key
@@ -130,7 +130,7 @@ enum GyroActivationMode: String, Codable {
     case hold, toggle
 }
 
-struct GyroConfig: Codable {
+struct GyroConfig: Codable, Equatable {
     var enabled: Bool = false
     var sensitivity: Double = 8.0
     // Which raw gyro axis ("x"/"y"/"z") drives on-screen horizontal/vertical
@@ -210,7 +210,7 @@ enum CombineGyroSource: String, Codable {
 /// One complete set of settings for using both Joy-Cons together — everything
 /// that can differ between the two ways of holding them. `CombineMode` selects
 /// which profile is live; the other keeps its own values untouched.
-struct CombineProfile: Codable {
+struct CombineProfile: Codable, Equatable {
     // Independent from AppConfig's top-level `buttons`: both-at-once can want
     // different bindings than either controller alone, and the two holding
     // modes can want different bindings from each other.
@@ -274,7 +274,7 @@ struct CombineProfile: Codable {
 // profile per holding mode, plus which of them is selected. While both halves
 // are present these take over from the per-side settings entirely: see
 // `CombineCoordinator` and `ControllerMapper.resolveMapping`.
-struct CombineConfig: Codable {
+struct CombineConfig: Codable, Equatable {
     var mode: CombineMode = .separate
     // Shared by both holding modes rather than living inside a profile: it has
     // its own settings tab, outside the mode switch, because an FN combination
@@ -324,7 +324,7 @@ struct CombineConfig: Codable {
 // different (axis, sign) combinations on the two sides. So gyro settings are
 // per-side, same as the sticks, rather than one config applied to whichever
 // controller happens to be connected.
-struct AppConfig: Codable {
+struct AppConfig: Codable, Equatable {
     var buttons: [String: ButtonAction] = [:]
     var leftStick: StickConfig = StickConfig()
     var rightStick: StickConfig = StickConfig()
