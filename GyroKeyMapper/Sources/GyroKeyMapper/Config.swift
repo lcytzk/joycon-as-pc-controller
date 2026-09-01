@@ -14,9 +14,85 @@ let buttonNames: [JoyCon.Button: String] = [
     .Start: "Start", .Select: "Select",
 ]
 
-struct ButtonAction: Codable {
+struct ButtonAction: Codable, Equatable {
     var key: String?
     var mouseButton: String? // "left" | "right" | "center"
+}
+
+/// One FN key and the combinations it unlocks.
+///
+/// An FN key keeps its ordinary binding on a *tap* (see `ButtonSession`), so
+/// designating one costs nothing — which is why there can be several rather
+/// than exactly one.
+///
+/// `bindings` holds only the combinations actually asked for. A button missing
+/// from it keeps doing whatever it does without FN: the equivalent of a
+/// transparent key, and the reason this list stays short rather than being a
+/// second copy of every button.
+struct FnLayer: Codable, Equatable {
+    /// A name from `buttonNames`, or nil while none has been chosen.
+    var key: String? = nil
+    var bindings: [String: ButtonAction] = [:]
+
+    init(key: String? = nil, bindings: [String: ButtonAction] = [:]) {
+        self.key = key
+        self.bindings = bindings
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decodeIfPresent(String.self, forKey: .key)
+        bindings = try container.decodeIfPresent([String: ButtonAction].self, forKey: .bindings) ?? [:]
+    }
+
+    /// Pointed at an actual button. A half-finished layer must change nothing,
+    /// or switching the feature on before choosing a key would swallow one.
+    var isConfigured: Bool { !(key ?? "").isEmpty }
+}
+
+/// Every FN key available while both Joy-Cons are connected, plus the one switch
+/// that turns the lot on.
+///
+/// Only meaningful in combined operation: an FN combination will routinely span
+/// the two halves (FN on the left, the bound button on the right), which is not
+/// something a single controller can express.
+struct FnConfig: Codable, Equatable {
+    var enabled: Bool = false
+    var layers: [FnLayer] = []
+
+    init(enabled: Bool = false, layers: [FnLayer] = []) {
+        self.enabled = enabled
+        self.layers = layers
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        layers = try container.decodeIfPresent([FnLayer].self, forKey: .layers) ?? []
+    }
+
+    var activeLayers: [FnLayer] { enabled ? layers.filter { $0.isConfigured } : [] }
+
+    func layer(forKey name: String) -> FnLayer? { activeLayers.first { $0.key == name } }
+
+    /// Whether this button is an FN key. Such a button emits nothing while
+    /// held — only on a tap.
+    func isFnKey(_ name: String) -> Bool { layer(forKey: name) != nil }
+
+    /// Buttons already spoken for as FN keys, so the settings page can keep them
+    /// out of the combination lists.
+    var reservedKeys: Set<String> { Set(activeLayers.compactMap { $0.key }) }
+
+    /// What a button does, given which FN keys are held right now.
+    ///
+    /// Holding two FN keys at once is not a gesture this supports. Rather than
+    /// invent a winner, an ambiguous state produces no output at all — better
+    /// to do nothing than to do something the user can't predict.
+    func action(for name: String, base: [String: ButtonAction], engaged: [String]) -> ButtonAction? {
+        guard engaged.count <= 1 else { return nil }
+        if let key = engaged.first, let binding = layer(forKey: key)?.bindings[name] { return binding }
+        return base[name]
+    }
 }
 
 enum StickMode: String, Codable {
@@ -200,6 +276,10 @@ struct CombineProfile: Codable {
 // `CombineCoordinator` and `ControllerMapper.resolveMapping`.
 struct CombineConfig: Codable {
     var mode: CombineMode = .separate
+    // Shared by both holding modes rather than living inside a profile: it has
+    // its own settings tab, outside the mode switch, because an FN combination
+    // spans both halves and isn't a property of how the pair is held.
+    var fn: FnConfig = FnConfig()
     var separate: CombineProfile = CombineProfile()
     var grip: CombineProfile = CombineProfile()
 
@@ -214,8 +294,9 @@ struct CombineConfig: Codable {
 
     var activeProfile: CombineProfile { self[mode] }
 
-    init(mode: CombineMode = .separate, separate: CombineProfile = CombineProfile(), grip: CombineProfile = CombineProfile()) {
+    init(mode: CombineMode = .separate, fn: FnConfig = FnConfig(), separate: CombineProfile = CombineProfile(), grip: CombineProfile = CombineProfile()) {
         self.mode = mode
+        self.fn = fn
         self.separate = separate
         self.grip = grip
         normalize()
@@ -224,6 +305,7 @@ struct CombineConfig: Codable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         mode = try container.decodeIfPresent(CombineMode.self, forKey: .mode) ?? .separate
+        fn = try container.decodeIfPresent(FnConfig.self, forKey: .fn) ?? FnConfig()
         separate = try container.decodeIfPresent(CombineProfile.self, forKey: .separate) ?? CombineProfile()
         grip = try container.decodeIfPresent(CombineProfile.self, forKey: .grip) ?? CombineProfile()
         normalize()
@@ -376,6 +458,7 @@ enum KeyValueConfigCodec {
         encodeGyro(config.rightGyro, prefix: "gyro.right", into: &lines)
 
         lines.append("combine.mode=\(config.combine.mode.rawValue)")
+        encodeFn(config.combine.fn, prefix: "combine.fn", into: &lines)
         encodeCombineProfile(config.combine.separate, prefix: "combine.separate", into: &lines)
         encodeCombineProfile(config.combine.grip, prefix: "combine.grip", into: &lines)
 
@@ -437,7 +520,7 @@ enum KeyValueConfigCodec {
         let mode = values["combine.mode"].flatMap(CombineMode.init(rawValue:)) ?? .separate
         let hasProfiles = values.keys.contains { $0.hasPrefix("combine.separate.") || $0.hasPrefix("combine.grip.") }
         guard hasProfiles else {
-            var combine = CombineConfig(mode: mode)
+            var combine = CombineConfig(mode: mode, fn: decodeFn(prefix: "combine.fn", from: values))
             combine[mode] = CombineProfile(
                 buttons: decodeButtons(prefix: "combine.button", from: values),
                 leftGyro: decodeGyro(prefix: "combine.gyro.left", from: values),
@@ -447,6 +530,7 @@ enum KeyValueConfigCodec {
         }
         return CombineConfig(
             mode: mode,
+            fn: decodeFn(prefix: "combine.fn", from: values),
             separate: decodeCombineProfile(prefix: "combine.separate", from: values),
             grip: decodeCombineProfile(prefix: "combine.grip", from: values)
         )
@@ -470,6 +554,38 @@ enum KeyValueConfigCodec {
             }
         }
         return buttons
+    }
+
+    private static func encodeFn(_ fn: FnConfig, prefix: String, into lines: inout [String]) {
+        lines.append("\(prefix).enabled=\(fn.enabled)")
+        for (index, layer) in fn.layers.enumerated() {
+            let layerPrefix = "\(prefix).\(index)"
+            if let key = layer.key, !key.isEmpty { lines.append("\(layerPrefix).key=\(key)") }
+            encodeButtons(layer.bindings, prefix: "\(layerPrefix).button", into: &lines)
+        }
+    }
+
+    private static func decodeFn(prefix: String, from values: [String: String]) -> FnConfig {
+        // Indices are read back from the file rather than assumed up to some
+        // ceiling, and are re-numbered contiguously on the next save.
+        var indices: Set<Int> = []
+        for key in values.keys where key.hasPrefix("\(prefix).") {
+            let rest = key.dropFirst(prefix.count + 1)
+            guard let dot = rest.firstIndex(of: "."), let index = Int(rest[rest.startIndex..<dot]) else { continue }
+            indices.insert(index)
+        }
+
+        let layers = indices.sorted().compactMap { index -> FnLayer? in
+            let layerPrefix = "\(prefix).\(index)"
+            let layer = FnLayer(
+                key: values["\(layerPrefix).key"],
+                bindings: decodeButtons(prefix: "\(layerPrefix).button", from: values)
+            )
+            // A stored layer with neither a key nor a binding is noise.
+            return (layer.isConfigured || !layer.bindings.isEmpty) ? layer : nil
+        }
+
+        return FnConfig(enabled: values["\(prefix).enabled"].flatMap(Bool.init) ?? false, layers: layers)
     }
 
     private static func encodeStick(_ stick: StickConfig, prefix: String, into lines: inout [String]) {

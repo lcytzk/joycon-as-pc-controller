@@ -23,11 +23,14 @@ final class CombineCoordinator {
     struct Snapshot {
         var isCombined = false
         var profile = CombineProfile()
+        /// Shared across holding modes — see `CombineConfig.fn`.
+        var fn = FnConfig()
     }
 
     private let lock = NSLock()
     private var isCombined = false
     private var profile = CombineProfile()
+    private var fn = FnConfig()
 
     // Activation lives here rather than per-mapper because the button that
     // arms a fused gyro can sit on either half — in a grip the pair is one
@@ -44,25 +47,62 @@ final class CombineCoordinator {
     private var busSum = SIMD3<Double>()
     private var busCount = 0
 
+    // FN lives here for the same reason activation does, and it matters more:
+    // the whole point of the feature is combinations that span the two halves,
+    // and each half's button events only ever reach its own mapper.
+    private var fnState = FnHoldState()
+
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(isCombined: isCombined, profile: profile)
+        return Snapshot(isCombined: isCombined, profile: profile, fn: fn)
     }
 
     /// Called when a controller connects or disconnects, or the profile is
     /// edited. Anything carried over from the previous arrangement — a
     /// half-full bus, an activation that was held when the other half went
     /// away — describes a setup that no longer exists, so it goes.
-    func update(isCombined: Bool, profile: CombineProfile) {
+    func update(isCombined: Bool, profile: CombineProfile, fn: FnConfig) {
         lock.lock()
         self.isCombined = isCombined
         self.profile = profile
+        self.fn = fn
         activationHeld = false
         needsRecenter = false
         busSum = SIMD3<Double>()
         busCount = 0
+        fnState.reset()
         lock.unlock()
+    }
+
+    // MARK: - FN
+
+    func fnPress(_ key: String, now: CFTimeInterval) {
+        lock.lock()
+        fnState.press(key, now: now)
+        lock.unlock()
+    }
+
+    /// Returns whether the release counts as a tap.
+    func fnRelease(_ key: String, now: CFTimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return fnState.release(key, now: now)
+    }
+
+    /// Any other button going down settles every held FN key as a hold — and
+    /// that button may be on the other half, which is exactly why this can't be
+    /// tracked per controller.
+    func fnNoteOtherPress() {
+        lock.lock()
+        fnState.noteOtherPress()
+        lock.unlock()
+    }
+
+    func fnEngagedKeys() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return fnState.engaged
     }
 
     func deposit(_ raw: SIMD3<Double>) {
@@ -489,5 +529,59 @@ struct GyroAlignment {
         guard let best = ranked.first, abs(best.correlation) >= minimumCorrelation else { return nil }
         if ranked.count > 1, abs(best.correlation) < abs(ranked[1].correlation) * minimumMargin { return nil }
         return FusionAlignment.Entry(axis: best.index, sign: best.correlation < 0 ? -1 : 1)
+    }
+}
+
+
+/// Which FN keys are held, and whether letting one go counts as a tap.
+///
+/// Shared between the two halves rather than held per controller: an FN key on
+/// one half is routinely combined with a button on the other, and the button
+/// that settles a hold-vs-tap decision is frequently not on the same controller
+/// as the FN key itself.
+struct FnHoldState {
+    /// Held longer than this and it was a hold, whatever else happened. The
+    /// usual keyboard-firmware default: long enough not to catch a deliberate
+    /// tap over Bluetooth, short enough not to feel sticky.
+    var tappingTerm: CFTimeInterval = 0.2
+
+    private struct Hold {
+        var pressedAt: CFTimeInterval
+        /// Set once any other button is pressed while this FN key is down. That
+        /// button may have consumed the layer, so this is no longer a tap —
+        /// however quickly the FN key is then let go.
+        var interrupted = false
+    }
+
+    private var order: [String] = []
+    private var holds: [String: Hold] = [:]
+
+    /// FN keys currently held, in press order.
+    var engaged: [String] { order }
+
+    mutating func press(_ key: String, now: CFTimeInterval) {
+        // A second FN key going down also settles the first as a hold.
+        noteOtherPress()
+        if !order.contains(key) { order.append(key) }
+        holds[key] = Hold(pressedAt: now)
+    }
+
+    /// Releases the key and reports whether it was a tap — quick, and with the
+    /// layer unused.
+    mutating func release(_ key: String, now: CFTimeInterval) -> Bool {
+        order.removeAll { $0 == key }
+        guard let hold = holds.removeValue(forKey: key) else { return false }
+        return now - hold.pressedAt < tappingTerm && !hold.interrupted
+    }
+
+    mutating func noteOtherPress() {
+        for key in order {
+            holds[key]?.interrupted = true
+        }
+    }
+
+    mutating func reset() {
+        order.removeAll()
+        holds.removeAll()
     }
 }

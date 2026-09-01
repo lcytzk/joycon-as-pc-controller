@@ -76,6 +76,39 @@ private final class RecordButton: NSButton {
     weak var targetField: NSTextField?
 }
 
+/// One "FN + button → action" line.
+private final class FnRow {
+    let buttonPopup = NSPopUpButton()
+    let typePopup = NSPopUpButton()
+    let keyField = NSTextField()
+    let removeButton = NSButton(title: "Remove", target: nil, action: nil)
+    var container: NSView?
+}
+
+/// One FN key and its combinations.
+private final class FnLayerControls {
+    let keyPopup = NSPopUpButton()
+    let removeButton = NSButton(title: "Remove FN Key", target: nil, action: nil)
+    let rowsStack = NSStackView()
+    let addRowButton = NSButton(title: "+ Add Combination", target: nil, action: nil)
+    var rows: [FnRow] = []
+    var container: NSView?
+}
+
+/// The whole FN page. Combinations are built as the user adds them rather than
+/// being a row per button: 22 rows of mostly-empty controls per FN key would
+/// bury the handful of bindings that actually exist.
+private final class FnControls {
+    let enabledCheckbox = NSButton(checkboxWithTitle: "Enable FN keys", target: nil, action: nil)
+    let statusLabel = NSTextField(wrappingLabelWithString: "")
+    let liveLabel = NSTextField(wrappingLabelWithString: "")
+    let layersStack = NSStackView()
+    let addLayerButton = NSButton(title: "+ Add FN Key", target: nil, action: nil)
+    var layers: [FnLayerControls] = []
+    /// Everything below the enable checkbox, so it can be dimmed as a unit.
+    weak var body: NSStackView?
+}
+
 /// A plain NSView defaults to a non-flipped (bottom-left-origin) coordinate
 /// system, which makes NSScrollView open showing the *bottom* of a taller-
 /// than-viewport document view instead of the top. Flipping it is the
@@ -98,6 +131,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private let onSave: (AppConfig) -> Void
 
     private var buttonRows: [ButtonRow] = []
+    // FN gets its own tab rather than a section on an existing page: a
+    // combination routinely spans the two halves, so it belongs to neither
+    // side's page, and it isn't a property of how the pair is held either.
+    private let fnControls = FnControls()
 
     private let leftStickControls = StickControls()
     private let rightStickControls = StickControls()
@@ -204,9 +241,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         combineItem.label = "Combine"
         combineItem.view = buildScrollablePage(buildCombinePage())
 
+        let fnItem = NSTabViewItem(identifier: "combineFn")
+        fnItem.label = "Combine FN"
+        fnItem.view = buildScrollablePage(buildFnPage())
+
         tabView.addTabViewItem(leftItem)
         tabView.addTabViewItem(rightItem)
         tabView.addTabViewItem(combineItem)
+        tabView.addTabViewItem(fnItem)
 
         contentView.addSubview(tabView)
         NSLayoutConstraint.activate([
@@ -262,6 +304,176 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         let label = NSTextField(labelWithString: text)
         label.font = .boldSystemFont(ofSize: 13)
         return label
+    }
+
+    /// The FN page: which buttons act as FN, and what each unlocks.
+    ///
+    /// Its own tab rather than a section on an existing page, because a
+    /// combination routinely spans the two halves — FN under a left-hand finger,
+    /// the bound button on the right — so it belongs to neither side's page, and
+    /// it is not a property of how the pair is held either.
+    private func buildFnPage() -> NSView {
+        let mainStack = NSStackView()
+        mainStack.orientation = .vertical
+        mainStack.alignment = .leading
+        mainStack.spacing = 16
+
+        fnControls.statusLabel.isSelectable = false
+        fnControls.statusLabel.maximumNumberOfLines = 2
+        fnControls.statusLabel.preferredMaxLayoutWidth = 460
+        fnControls.statusLabel.widthAnchor.constraint(equalToConstant: 460).isActive = true
+        mainStack.addArrangedSubview(fnControls.statusLabel)
+
+        fnControls.enabledCheckbox.target = self
+        fnControls.enabledCheckbox.action = #selector(fnEnabledChanged(_:))
+        mainStack.addArrangedSubview(fnControls.enabledCheckbox)
+
+        let body = NSStackView()
+        body.orientation = .vertical
+        body.alignment = .leading
+        body.spacing = 14
+        fnControls.body = body
+
+        body.addArrangedSubview(hintLabel("An FN key keeps its ordinary binding on a tap and switches layer when held — so making a button an FN key costs you nothing. Its tap action is simply its row in the Combine tab's button list; leave that row unset for a key that does nothing on its own.", lines: 4, width: 460))
+        body.addArrangedSubview(hintLabel("Buttons you don't list keep doing what they do without FN. Holding two FN keys at once does nothing at all, rather than guessing which one you meant.", lines: 3, width: 460))
+
+        fnControls.layersStack.orientation = .vertical
+        fnControls.layersStack.alignment = .leading
+        fnControls.layersStack.spacing = 14
+        body.addArrangedSubview(fnControls.layersStack)
+
+        fnControls.addLayerButton.target = self
+        fnControls.addLayerButton.action = #selector(addFnLayer(_:))
+        body.addArrangedSubview(fnControls.addLayerButton)
+
+        // Live feedback, because everything else on this page is a guess until
+        // you can see whether a hold actually registered.
+        fnControls.liveLabel.isSelectable = false
+        fnControls.liveLabel.maximumNumberOfLines = 2
+        fnControls.liveLabel.preferredMaxLayoutWidth = 460
+        fnControls.liveLabel.widthAnchor.constraint(equalToConstant: 460).isActive = true
+        body.addArrangedSubview(fnControls.liveLabel)
+        updateFnState(engaged: nil, combined: false)
+
+        mainStack.addArrangedSubview(body)
+        return mainStack
+    }
+
+    /// Buttons still free to be bound under FN: everything that isn't already
+    /// acting as an FN key. Offering a choice that would discard itself on save
+    /// is worse than not offering it.
+    private func availableFnButtons() -> [String] {
+        let reserved = Set(fnControls.layers.compactMap { $0.keyPopup.selectedItem?.representedObject as? String })
+        return (leftJoyConButtons + rightJoyConButtons).filter { !reserved.contains($0) }
+    }
+
+    /// What a *new* row in this layer should default to: a button the layer
+    /// isn't already binding. Two rows on the same button would silently
+    /// collapse into one on save, with no sign of which was kept.
+    private func nextFnButton(for layer: FnLayerControls) -> String? {
+        let taken = Set(layer.rows.compactMap { $0.buttonPopup.selectedItem?.representedObject as? String })
+        return availableFnButtons().first { !taken.contains($0) }
+    }
+
+    private func addFnLayerControls(key: String?) {
+        let layer = FnLayerControls()
+
+        layer.keyPopup.addItem(withTitle: "— none —")
+        layer.keyPopup.lastItem?.representedObject = ""
+        for name in leftJoyConButtons + rightJoyConButtons {
+            layer.keyPopup.addItem(withTitle: name)
+            layer.keyPopup.lastItem?.representedObject = name
+        }
+        layer.keyPopup.target = self
+        layer.keyPopup.action = #selector(fnKeyChanged(_:))
+        let selected = key ?? ""
+        layer.keyPopup.selectItem(at: layer.keyPopup.itemArray.firstIndex { ($0.representedObject as? String) == selected } ?? 0)
+
+        layer.removeButton.target = self
+        layer.removeButton.action = #selector(removeFnLayer(_:))
+
+        layer.rowsStack.orientation = .vertical
+        layer.rowsStack.alignment = .leading
+        layer.rowsStack.spacing = 4
+
+        layer.addRowButton.target = self
+        layer.addRowButton.action = #selector(addFnCombination(_:))
+
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+        container.addArrangedSubview(row([labeled("FN key", width: 60), layer.keyPopup, layer.removeButton]))
+        container.addArrangedSubview(layer.rowsStack)
+        container.addArrangedSubview(layer.addRowButton)
+        layer.container = container
+
+        fnControls.layersStack.addArrangedSubview(container)
+        fnControls.layers.append(layer)
+    }
+
+    private func addFnRow(to layer: FnLayerControls, name: String?, action: ButtonAction?) {
+        let fnRow = FnRow()
+
+        var candidates = availableFnButtons()
+        // A saved binding stays selectable even if it is now spoken for
+        // elsewhere, so the row shows the truth rather than silently changing.
+        if let name = name, !candidates.contains(name) { candidates.append(name) }
+        for candidate in candidates {
+            fnRow.buttonPopup.addItem(withTitle: candidate)
+            fnRow.buttonPopup.lastItem?.representedObject = candidate
+        }
+        fnRow.buttonPopup.target = self
+        fnRow.buttonPopup.action = #selector(settingsChanged(_:))
+        let wanted = name ?? nextFnButton(for: layer) ?? candidates.first
+        if let wanted = wanted,
+           let index = fnRow.buttonPopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == wanted }) {
+            fnRow.buttonPopup.selectItem(at: index)
+        }
+
+        fnRow.typePopup.addItems(withTitles: actionKindTitles)
+        fnRow.typePopup.target = self
+        fnRow.typePopup.action = #selector(buttonTypeChanged(_:))
+
+        fnRow.keyField.placeholderString = "key name, e.g. z"
+        fnRow.keyField.delegate = self
+        fnRow.keyField.widthAnchor.constraint(equalToConstant: 130).isActive = true
+
+        fnRow.removeButton.target = self
+        fnRow.removeButton.action = #selector(removeFnCombination(_:))
+
+        // Same encoding as the plain button rows, so "Mouse Left" and a recorded
+        // combo behave identically here.
+        if let mouse = action?.mouseButton {
+            switch mouse.lowercased() {
+            case "right": fnRow.typePopup.selectItem(at: 3)
+            case "center", "middle": fnRow.typePopup.selectItem(at: 4)
+            default: fnRow.typePopup.selectItem(at: 2)
+            }
+            fnRow.keyField.isEnabled = false
+        } else if let key = action?.key {
+            fnRow.typePopup.selectItem(at: 1)
+            fnRow.keyField.stringValue = key
+            fnRow.keyField.isEnabled = true
+        } else {
+            fnRow.typePopup.selectItem(at: 0)
+            fnRow.keyField.isEnabled = false
+        }
+
+        let container = row([
+            labeled("FN +", width: 40), fnRow.buttonPopup,
+            fnRow.typePopup, fnRow.keyField, recordButton(for: fnRow.keyField), fnRow.removeButton,
+        ])
+        fnRow.container = container
+        layer.rowsStack.addArrangedSubview(container)
+        layer.rows.append(fnRow)
+    }
+
+    private func clearFnLayers() {
+        for layer in fnControls.layers {
+            layer.container?.removeFromSuperview()
+        }
+        fnControls.layers.removeAll()
     }
 
     private func buildSidePage(buttonNames: [String], stick: StickControls, gyro: GyroControls) -> NSView {
@@ -534,6 +746,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     private func loadFromConfig() {
         isReloading = true
+        loadFn(config.combine.fn)
         loadButtons(config.buttons, into: buttonRows)
         loadStick(config.leftStick, into: leftStickControls)
         loadStick(config.rightStick, into: rightStickControls)
@@ -588,6 +801,77 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
     }
 
+    private func loadFn(_ fn: FnConfig) {
+        fnControls.enabledCheckbox.state = fn.enabled ? .on : .off
+        clearFnLayers()
+        // Every FN key has to exist before any combination row is built: the
+        // rows offer "buttons not already acting as FN", and a key that hasn't
+        // been created yet doesn't count as taken.
+        for layer in fn.layers {
+            addFnLayerControls(key: layer.key)
+        }
+        for (index, layer) in fn.layers.enumerated() where index < fnControls.layers.count {
+            // Canonical button order rather than dictionary order, so the list
+            // doesn't reshuffle itself every time it is reloaded.
+            for name in leftJoyConButtons + rightJoyConButtons {
+                guard let action = layer.bindings[name], name != (layer.key ?? "") else { continue }
+                addFnRow(to: fnControls.layers[index], name: name, action: action)
+            }
+        }
+        applyFnEnabled()
+    }
+
+    private func applyFnEnabled() {
+        let enabled = fnControls.enabledCheckbox.state == .on
+        fnControls.body?.alphaValue = enabled ? 1.0 : 0.45
+        setControlsEnabled(in: fnControls.body ?? NSStackView(), enabled)
+
+        // `setControlsEnabled` is a blanket pass, so it re-enables key fields
+        // that only apply to a "Key" row. Left alone, a Mouse or None row would
+        // offer an editable field whose contents `readFn` then throws away.
+        for layer in fnControls.layers {
+            for fnRow in layer.rows {
+                fnRow.keyField.isEnabled = enabled && fnRow.typePopup.indexOfSelectedItem == 1
+            }
+        }
+    }
+
+    private func readFn() -> FnConfig {
+        var layers: [FnLayer] = []
+        var claimed: Set<String> = []
+
+        for layerControls in fnControls.layers {
+            let key = layerControls.keyPopup.selectedItem?.representedObject as? String ?? ""
+            // Two FN layers on the same button would be indistinguishable, so
+            // the later one keeps its combinations but loses the key.
+            let unique = key.isEmpty || claimed.contains(key) ? "" : key
+            if !unique.isEmpty { claimed.insert(unique) }
+
+            var bindings: [String: ButtonAction] = [:]
+            for fnRow in layerControls.rows {
+                guard let name = fnRow.buttonPopup.selectedItem?.representedObject as? String else { continue }
+                // FN + itself is nothing.
+                guard name != unique else { continue }
+                switch fnRow.typePopup.indexOfSelectedItem {
+                case 1:
+                    let combo = fnRow.keyField.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
+                    highlightIfUnknown(fnRow.keyField, text: combo)
+                    if !combo.isEmpty && isFullyKnown(combo) {
+                        bindings[name] = ButtonAction(key: combo, mouseButton: nil)
+                    }
+                case 2: bindings[name] = ButtonAction(key: nil, mouseButton: "left")
+                case 3: bindings[name] = ButtonAction(key: nil, mouseButton: "right")
+                case 4: bindings[name] = ButtonAction(key: nil, mouseButton: "center")
+                default: fnRow.keyField.textColor = .labelColor
+                }
+            }
+
+            layers.append(FnLayer(key: unique.isEmpty ? nil : unique, bindings: bindings))
+        }
+
+        return FnConfig(enabled: fnControls.enabledCheckbox.state == .on, layers: layers)
+    }
+
     private func loadStick(_ stick: StickConfig, into controls: StickControls) {
         switch stick.mode {
         case .none: controls.modePopup.selectItem(at: 0)
@@ -635,6 +919,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         // screen survives — only the visible one is read back from controls.
         var combine = config.combine
         combine.mode = combineMode
+        combine.fn = readFn()
         combine[combineMode] = readCombineProfile()
         newConfig.combine = combine
 
@@ -845,8 +1130,59 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     // MARK: - Actions
 
     @objc private func buttonTypeChanged(_ sender: NSPopUpButton) {
-        guard let r = (buttonRows + combineButtonRows).first(where: { $0.typePopup === sender }) else { return }
-        r.keyField.isEnabled = sender.indexOfSelectedItem == 1
+        if let r = (buttonRows + combineButtonRows).first(where: { $0.typePopup === sender }) {
+            r.keyField.isEnabled = sender.indexOfSelectedItem == 1
+            commit()
+            return
+        }
+        let fnRows = fnControls.layers.flatMap { $0.rows }
+        guard let fnRow = fnRows.first(where: { $0.typePopup === sender }) else { return }
+        fnRow.keyField.isEnabled = sender.indexOfSelectedItem == 1
+        commit()
+    }
+
+    @objc private func fnEnabledChanged(_ sender: NSButton) {
+        applyFnEnabled()
+        commit()
+    }
+
+    /// Moving an FN key changes which buttons are still free to bind under it,
+    /// so the lists are rebuilt from the saved result rather than left showing
+    /// choices that would be dropped on the next save.
+    @objc private func fnKeyChanged(_ sender: NSPopUpButton) {
+        commit()
+        let fn = readFn()
+        isReloading = true
+        loadFn(fn)
+        isReloading = false
+    }
+
+    @objc private func addFnLayer(_ sender: NSButton) {
+        addFnLayerControls(key: availableFnButtons().first)
+        applyFnEnabled()
+        commit()
+    }
+
+    @objc private func removeFnLayer(_ sender: NSButton) {
+        guard let index = fnControls.layers.firstIndex(where: { $0.removeButton === sender }) else { return }
+        fnControls.layers[index].container?.removeFromSuperview()
+        fnControls.layers.remove(at: index)
+        commit()
+    }
+
+    @objc private func addFnCombination(_ sender: NSButton) {
+        guard let layer = fnControls.layers.first(where: { $0.addRowButton === sender }) else { return }
+        addFnRow(to: layer, name: nil, action: nil)
+        applyFnEnabled()
+        commit()
+    }
+
+    @objc private func removeFnCombination(_ sender: NSButton) {
+        for layer in fnControls.layers {
+            guard let index = layer.rows.firstIndex(where: { $0.removeButton === sender }) else { continue }
+            layer.rows[index].container?.removeFromSuperview()
+            layer.rows.remove(at: index)
+        }
         commit()
     }
 
@@ -976,6 +1312,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         clearCalibrationButton.isEnabled = combineSavedAlignment.map { !$0.isEmpty } ?? false
     }
 
+    /// Shows whether an FN key is being held right now. Hold one while this
+    /// page is open and it says so — which separates "the hold didn't register"
+    /// from "the binding didn't apply", the two things that look identical from
+    /// the outside.
+    func updateFnState(engaged: String?, combined: Bool) {
+        if let engaged = engaged {
+            fnControls.liveLabel.stringValue = "● Holding \(engaged) — its combinations are live right now."
+            fnControls.liveLabel.textColor = .systemGreen
+        } else if combined {
+            fnControls.liveLabel.stringValue = "Hold an FN key on the controller and this line will say so."
+            fnControls.liveLabel.textColor = .secondaryLabelColor
+        } else {
+            fnControls.liveLabel.stringValue = "Connect both Joy-Cons to try an FN key."
+            fnControls.liveLabel.textColor = .secondaryLabelColor
+        }
+    }
+
     private enum FusedAxis { case horizontal, vertical }
 
     private func fusedAxisIndex(_ axis: FusedAxis) -> Int {
@@ -1036,6 +1389,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         case (false, false):
             combineStatusLabel.stringValue = "○ No Joy-Con connected."
             combineStatusLabel.textColor = .secondaryLabelColor
+        }
+
+        // FN only exists in combined operation, so the page says so plainly
+        // rather than letting someone configure it and find it inert.
+        if leftConnected && rightConnected {
+            fnControls.statusLabel.stringValue = "● Both Joy-Cons connected — FN keys are in effect."
+            fnControls.statusLabel.textColor = .systemGreen
+        } else {
+            fnControls.statusLabel.stringValue = "○ FN keys only apply while both Joy-Cons are connected — a combination normally spans the two halves. Nothing here affects a single controller."
+            fnControls.statusLabel.textColor = .secondaryLabelColor
         }
     }
 }

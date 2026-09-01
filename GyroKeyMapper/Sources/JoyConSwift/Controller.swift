@@ -618,6 +618,28 @@ public class Controller {
         }
     }
     
+    /// Read the controller's regulated battery voltage.
+    ///
+    /// The battery level carried by every input report is only four coarse
+    /// buckets (see `readStandardState`); this is the finer reading, and the
+    /// only way to put a number on the charge. The value is raw — roughly
+    /// 1320-1680, corresponding to about 3.3-4.2 V.
+    ///
+    /// - Parameter handler: Receives the raw reading, or nil on NACK/timeout.
+    public func readRegulatedVoltage(handler: @escaping (UInt16?) -> Void) {
+        self.sendSubcommand(type: .getRegulatedVoltage, data: []) { response in
+            guard let response = response else {
+                // NACK or timeout — the caller decides what to do without it.
+                handler(nil)
+                return
+            }
+            // Reply data begins at byte 14, same as every other subcommand
+            // reply here (cf. `handleReadSPIFlash` below).
+            let ptr = IOHIDValueGetBytePtr(response)
+            handler(ReadUInt16(from: ptr + 14))
+        }
+    }
+
     func handleReadSPIFlash(value: IOHIDValue) {
         let ptr = IOHIDValueGetBytePtr(value)
         let address = ReadUInt32(from: ptr+14)

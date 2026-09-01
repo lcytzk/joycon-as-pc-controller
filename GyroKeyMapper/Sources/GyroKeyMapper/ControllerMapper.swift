@@ -63,6 +63,9 @@ final class ControllerMapper {
         // A button that just got remapped would otherwise never see its
         // release and stay held down system-wide.
         KeyboardOutput.shared.releaseAll(ownedBy: ObjectIdentifier(self))
+        inputLock.lock()
+        session.reset()
+        inputLock.unlock()
         // The learned placement of the other IMU is relative to *these* axis
         // choices, so choosing again throws it away rather than carrying a
         // stale answer into a different question.
@@ -106,6 +109,7 @@ final class ControllerMapper {
             gyro: gyro,
             role: role,
             buttons: profile.buttons,
+            fn: combineState.fn,
             leftStick: profile.leftStick,
             rightStick: profile.rightStick,
             savedAlignment: profile.fusionAlignment,
@@ -201,7 +205,10 @@ final class ControllerMapper {
     /// last velocity continues.
     private let staleSampleGrace: CFTimeInterval = 0.035
 
-    private var pressedButtons: Set<JoyCon.Button> = [] // IOHID thread only
+    /// Press/release bookkeeping and the FN layer's engaged state. Written from
+    /// the IOHID thread and reset when the mapping changes, so it sits under
+    /// `inputLock` like the rest of the shared input state.
+    private var session = ButtonSession()
     private var diagnostics: GyroDiagnostics?
 
     init(controller: JoyConSwift.Controller, config: AppConfig, combine: CombineCoordinator) {
@@ -277,9 +284,9 @@ final class ControllerMapper {
     // MARK: - Buttons (IOHID thread)
 
     private func handleButton(_ button: JoyCon.Button, isDown: Bool) {
-        if isDown { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
-
         let mapping = mappingSnapshot()
+        let name = buttonNames[button]
+
         if let activation = mapping.gyro.activationButton, activation == button {
             // While both halves are connected the activation state is shared:
             // the button that arms the gyro can sit on the controller that
@@ -310,8 +317,46 @@ final class ControllerMapper {
             }
         }
 
-        guard let name = buttonNames[button], let action = mapping.buttons[name] else { return }
-        perform(action, isDown: isDown, source: "button.\(name)")
+        guard let name = name else { return }
+
+        // The FN key drives the shared layer state and emits nothing of its own
+        // while held. Its ordinary binding fires on release, and only if the
+        // release turned out to be a tap — by which time the button is already
+        // up, so it goes out as press-then-release.
+        if mapping.fn.isFnKey(name) {
+            let now = CACurrentMediaTime()
+            if isDown {
+                combine.fnPress(name, now: now)
+            } else if combine.fnRelease(name, now: now), let tap = mapping.buttons[name] {
+                perform(tap, isDown: true, source: "button.\(name).tap")
+                perform(tap, isDown: false, source: "button.\(name).tap")
+            }
+            return
+        }
+
+        // Settles any held FN key as a hold rather than a tap. Done before the
+        // lookup, and through the coordinator, because the FN key in question is
+        // routinely on the other half.
+        if isDown { combine.fnNoteOtherPress() }
+
+        // Read outside the input lock: the two locks are then never held at
+        // once, so there is no ordering to get wrong.
+        let engaged = combine.fnEngagedKeys()
+        inputLock.lock()
+        let outcome = session.handle(
+            button: button, name: name, isDown: isDown,
+            base: mapping.buttons, fn: mapping.fn, engaged: engaged
+        )
+        inputLock.unlock()
+
+        switch outcome {
+        case .none:
+            break
+        case .press(let action):
+            perform(action, isDown: true, source: "button.\(name)")
+        case .release(let action):
+            perform(action, isDown: false, source: "button.\(name)")
+        }
     }
 
     private func perform(_ action: ButtonAction, isDown: Bool, source: String) {
@@ -768,6 +813,7 @@ struct ActiveMapping {
     var gyro: GyroRuntime
     var role: GyroRole = .driver
     var buttons: [String: ButtonAction] = [:]
+    var fn: FnConfig = FnConfig()
     var leftStick: StickConfig = StickConfig()
     var rightStick: StickConfig = StickConfig()
     /// A calibration saved in the profile, if there is one. Its presence is
