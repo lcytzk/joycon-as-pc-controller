@@ -270,7 +270,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         self.onTestModeChanged = onTestModeChanged
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 760),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false

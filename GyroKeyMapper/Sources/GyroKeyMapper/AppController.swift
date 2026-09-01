@@ -12,6 +12,7 @@ final class AppController: NSObject {
     /// they can be swapped out without disturbing the items below them.
     private var controllerMenuItems: [NSMenuItem] = []
     private var settingsWindowController: SettingsWindowController?
+    private let disconnectAllItem = NSMenuItem(title: "Disconnect All Devices", action: #selector(disconnectAll), keyEquivalent: "")
     private var liveUpdatesTimer: Timer?
     /// Separate from `liveUpdatesTimer`'s 0.25s cadence: the test pages are a
     /// short, occasional look at a stick dot and button highlights, and at
@@ -42,6 +43,10 @@ final class AppController: NSObject {
         statusItem.button?.title = "🎮"
 
         let menu = NSMenu()
+        menu.addItem(NSMenuItem.separator())
+
+        disconnectAllItem.target = self
+        menu.addItem(disconnectAllItem)
         menu.addItem(NSMenuItem.separator())
 
         let settingsItem = NSMenuItem(title: "Open Settings…", action: #selector(openSettings), keyEquivalent: ",")
@@ -255,7 +260,18 @@ final class AppController: NSObject {
         for (index, item) in controllerMenuItems.enumerated() {
             menu.insertItem(item, at: index)
         }
+        disconnectAllItem.isEnabled = !mappers.isEmpty
         publishConnectionState()
+    }
+
+    /// Tells every connected controller to drop its Bluetooth link, the same
+    /// "Set HCI state" subcommand macOS itself never has a way to trigger.
+    /// `handleDisconnect` (via `manager.disconnectHandler`) does the actual
+    /// cleanup once each one reports as removed — this only asks them to go.
+    @objc private func disconnectAll() {
+        for mapper in mappers.values {
+            mapper.controller.setHCIState(state: .disconnect)
+        }
     }
 
     /// Fusing places the second IMU by watching the user move the grip, so the
