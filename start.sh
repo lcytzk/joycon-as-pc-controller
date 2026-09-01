@@ -1,9 +1,13 @@
 #!/bin/bash
 set -e
-cd "$(dirname "$0")/GyroKeyMapper"
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR/GyroKeyMapper"
 
 BINARY=".build/release/GyroKeyMapper"
-PID_FILE=".build/GyroKeyMapper.pid"
+# Outside .build/ on purpose: that directory gets wiped whenever the build
+# system or layout changes, which would orphan a running instance that this
+# script can then no longer find to kill before starting a new one.
+PID_FILE="$ROOT_DIR/GyroKeyMapper.pid"
 
 # Stop whatever this script last started, so re-running it is a restart
 # rather than piling up a second instance (each would fight the other for

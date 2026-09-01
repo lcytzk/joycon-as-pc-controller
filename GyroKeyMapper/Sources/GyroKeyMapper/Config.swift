@@ -123,6 +123,36 @@ struct StickConfig: Codable, Equatable {
     }
 }
 
+// Which key a circular sweep holds down for its duration — tapping Tab
+// (clockwise) or Shift+Tab (counter-clockwise) underneath it — or `off` to
+// disable the gesture. `.ctrl` cycles browser tabs; `.command` is macOS's own
+// app switcher; `.option` carries no default system binding but is offered
+// since some apps bind their own.
+enum StickRotationTarget: String, Codable, CaseIterable {
+    case off, ctrl, option, command
+
+    var heldKeyName: String {
+        switch self {
+        case .off: return ""
+        case .ctrl: return "ctrl"
+        case .option: return "option"
+        case .command: return "cmd"
+        }
+    }
+}
+
+// Sweeping a stick in a circle only steps through tabs/apps while an FN key
+// is held — plain up/down/left/right play, with no FN involved, is common
+// enough that a sweep-shaped accident in it would otherwise misfire. FN
+// combinations already span both halves rather than belonging to either
+// stick, so this lives next to `FnConfig` on `CombineConfig` rather than
+// duplicated per stick per holding profile.
+struct StickRotationConfig: Codable, Equatable {
+    var target: StickRotationTarget = .off
+    // How much of a sweep counts as one Tab/Shift+Tab tap.
+    var degreesPerStep: Double = 90
+}
+
 // How `activationButton` turns the gyro mouse on and off — mutually
 // exclusive, since a button can't simultaneously mean "active while held"
 // and "toggles on/off when clicked".
@@ -280,6 +310,9 @@ struct CombineConfig: Codable, Equatable {
     // its own settings tab, outside the mode switch, because an FN combination
     // spans both halves and isn't a property of how the pair is held.
     var fn: FnConfig = FnConfig()
+    // Same reasoning as `fn`, and gated by it: see `StickRotationConfig`.
+    var leftStickRotation: StickRotationConfig = StickRotationConfig()
+    var rightStickRotation: StickRotationConfig = StickRotationConfig()
     var separate: CombineProfile = CombineProfile()
     var grip: CombineProfile = CombineProfile()
 
@@ -294,9 +327,16 @@ struct CombineConfig: Codable, Equatable {
 
     var activeProfile: CombineProfile { self[mode] }
 
-    init(mode: CombineMode = .separate, fn: FnConfig = FnConfig(), separate: CombineProfile = CombineProfile(), grip: CombineProfile = CombineProfile()) {
+    init(
+        mode: CombineMode = .separate, fn: FnConfig = FnConfig(),
+        leftStickRotation: StickRotationConfig = StickRotationConfig(),
+        rightStickRotation: StickRotationConfig = StickRotationConfig(),
+        separate: CombineProfile = CombineProfile(), grip: CombineProfile = CombineProfile()
+    ) {
         self.mode = mode
         self.fn = fn
+        self.leftStickRotation = leftStickRotation
+        self.rightStickRotation = rightStickRotation
         self.separate = separate
         self.grip = grip
         normalize()
@@ -306,6 +346,8 @@ struct CombineConfig: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         mode = try container.decodeIfPresent(CombineMode.self, forKey: .mode) ?? .separate
         fn = try container.decodeIfPresent(FnConfig.self, forKey: .fn) ?? FnConfig()
+        leftStickRotation = try container.decodeIfPresent(StickRotationConfig.self, forKey: .leftStickRotation) ?? StickRotationConfig()
+        rightStickRotation = try container.decodeIfPresent(StickRotationConfig.self, forKey: .rightStickRotation) ?? StickRotationConfig()
         separate = try container.decodeIfPresent(CombineProfile.self, forKey: .separate) ?? CombineProfile()
         grip = try container.decodeIfPresent(CombineProfile.self, forKey: .grip) ?? CombineProfile()
         normalize()
@@ -459,6 +501,8 @@ enum KeyValueConfigCodec {
 
         lines.append("combine.mode=\(config.combine.mode.rawValue)")
         encodeFn(config.combine.fn, prefix: "combine.fn", into: &lines)
+        encodeStickRotation(config.combine.leftStickRotation, prefix: "combine.rotation.left", into: &lines)
+        encodeStickRotation(config.combine.rightStickRotation, prefix: "combine.rotation.right", into: &lines)
         encodeCombineProfile(config.combine.separate, prefix: "combine.separate", into: &lines)
         encodeCombineProfile(config.combine.grip, prefix: "combine.grip", into: &lines)
 
@@ -520,7 +564,12 @@ enum KeyValueConfigCodec {
         let mode = values["combine.mode"].flatMap(CombineMode.init(rawValue:)) ?? .separate
         let hasProfiles = values.keys.contains { $0.hasPrefix("combine.separate.") || $0.hasPrefix("combine.grip.") }
         guard hasProfiles else {
-            var combine = CombineConfig(mode: mode, fn: decodeFn(prefix: "combine.fn", from: values))
+            var combine = CombineConfig(
+                mode: mode,
+                fn: decodeFn(prefix: "combine.fn", from: values),
+                leftStickRotation: decodeStickRotation(prefix: "combine.rotation.left", from: values),
+                rightStickRotation: decodeStickRotation(prefix: "combine.rotation.right", from: values)
+            )
             combine[mode] = CombineProfile(
                 buttons: decodeButtons(prefix: "combine.button", from: values),
                 leftGyro: decodeGyro(prefix: "combine.gyro.left", from: values),
@@ -531,8 +580,22 @@ enum KeyValueConfigCodec {
         return CombineConfig(
             mode: mode,
             fn: decodeFn(prefix: "combine.fn", from: values),
+            leftStickRotation: decodeStickRotation(prefix: "combine.rotation.left", from: values),
+            rightStickRotation: decodeStickRotation(prefix: "combine.rotation.right", from: values),
             separate: decodeCombineProfile(prefix: "combine.separate", from: values),
             grip: decodeCombineProfile(prefix: "combine.grip", from: values)
+        )
+    }
+
+    private static func encodeStickRotation(_ rotation: StickRotationConfig, prefix: String, into lines: inout [String]) {
+        lines.append("\(prefix).target=\(rotation.target.rawValue)")
+        lines.append("\(prefix).degreesPerStep=\(rotation.degreesPerStep)")
+    }
+
+    private static func decodeStickRotation(prefix: String, from values: [String: String]) -> StickRotationConfig {
+        StickRotationConfig(
+            target: values["\(prefix).target"].flatMap(StickRotationTarget.init(rawValue:)) ?? .off,
+            degreesPerStep: values["\(prefix).degreesPerStep"].flatMap(Double.init) ?? 90
         )
     }
 

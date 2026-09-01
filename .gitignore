@@ -7,6 +7,9 @@
 .build/
 .swiftpm/
 
+# start.sh's tracked pid, kept outside .build/ so it survives that being wiped
+/GyroKeyMapper.pid
+
 # Xcode (in case a project gets opened/generated later)
 *.DS_Store
 build/

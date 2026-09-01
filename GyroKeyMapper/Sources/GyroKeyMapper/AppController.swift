@@ -12,7 +12,13 @@ final class AppController: NSObject {
     /// they can be swapped out without disturbing the items below them.
     private var controllerMenuItems: [NSMenuItem] = []
     private var settingsWindowController: SettingsWindowController?
-    private var fusionStatusTimer: Timer?
+    private var liveUpdatesTimer: Timer?
+    /// Separate from `liveUpdatesTimer`'s 0.25s cadence: the test pages are a
+    /// short, occasional look at a stick dot and button highlights, and at
+    /// that cadence they read as choppy rather than a live gamepad tester.
+    /// The other indicators (fusion, FN, stick debug text) don't need this —
+    /// only the two visual test pages get the faster tick.
+    private var testPageTimer: Timer?
 
     /// Raw regulated-voltage readings, per controller.
     private var batteryVoltages: [ObjectIdentifier: UInt16] = [:]
@@ -93,7 +99,10 @@ final class AppController: NSObject {
     }
 
     private func refreshCombineState(adding extra: JoyConSwift.Controller? = nil) {
-        combine.update(isCombined: isCombined(including: extra), profile: config.combine.activeProfile, fn: config.combine.fn)
+        combine.update(
+            isCombined: isCombined(including: extra), profile: config.combine.activeProfile, fn: config.combine.fn,
+            leftStickRotation: config.combine.leftStickRotation, rightStickRotation: config.combine.rightStickRotation
+        )
     }
 
     private func notifyCombineStateChanged() {
@@ -264,8 +273,8 @@ final class AppController: NSObject {
         )
     }
 
-    private func startFusionStatusUpdates() {
-        guard fusionStatusTimer == nil else { return }
+    private func startLiveUpdates() {
+        guard liveUpdatesTimer == nil else { return }
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] timer in
             guard let self = self else {
                 timer.invalidate()
@@ -273,7 +282,7 @@ final class AppController: NSObject {
             }
             guard let window = self.settingsWindowController?.window, window.isVisible else {
                 timer.invalidate()
-                self.fusionStatusTimer = nil
+                self.liveUpdatesTimer = nil
                 return
             }
             let driver = self.mappers.values.first { $0.fusionStatus != .inactive }
@@ -285,19 +294,72 @@ final class AppController: NSObject {
                 engaged: self.combine.fnEngagedKeys().last,
                 combined: self.isCombined()
             )
+            let leftMapper = self.mappers.values.first { $0.controller.type == .JoyConL }
+            let rightMapper = self.mappers.values.first { $0.controller.type == .JoyConR }
+            self.settingsWindowController?.updateStickDebugState(
+                left: leftMapper?.leftStickDebug,
+                right: rightMapper?.rightStickDebug
+            )
         }
         RunLoop.main.add(timer, forMode: .common)
-        fusionStatusTimer = timer
+        liveUpdatesTimer = timer
+    }
+
+    /// A quick, occasional look rather than something left running — a fast
+    /// tick is worth it exactly because it doesn't run for long.
+    private func startTestPageUpdates() {
+        guard testPageTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            guard let window = self.settingsWindowController?.window, window.isVisible else {
+                timer.invalidate()
+                self.testPageTimer = nil
+                return
+            }
+            let leftMapper = self.mappers.values.first { $0.controller.type == .JoyConL }
+            let rightMapper = self.mappers.values.first { $0.controller.type == .JoyConR }
+            self.settingsWindowController?.updateTestPage(
+                isLeft: true, held: leftMapper?.heldButtons ?? [],
+                stick: leftMapper?.leftStickDebug, gyro: leftMapper?.rawGyro
+            )
+            self.settingsWindowController?.updateTestPage(
+                isLeft: false, held: rightMapper?.heldButtons ?? [],
+                stick: rightMapper?.rightStickDebug, gyro: rightMapper?.rawGyro
+            )
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        testPageTimer = timer
+    }
+
+    /// Whichever side's test tab is currently selected (both false the rest
+    /// of the time, including when the settings window closes) has its real
+    /// output suppressed — the other half, if any, keeps working normally.
+    private func setTestModeSuppressed(leftSuppressed: Bool, rightSuppressed: Bool) {
+        for mapper in mappers.values {
+            switch mapper.controller.type {
+            case .JoyConL: mapper.setTestModeSuppressed(leftSuppressed)
+            case .JoyConR: mapper.setTestModeSuppressed(rightSuppressed)
+            default: break
+            }
+        }
     }
 
     @objc private func openSettings() {
         if settingsWindowController == nil {
-            settingsWindowController = SettingsWindowController(config: config) { [weak self] newConfig in
-                self?.applyConfig(newConfig)
-            }
+            settingsWindowController = SettingsWindowController(
+                config: config,
+                onSave: { [weak self] newConfig in self?.applyConfig(newConfig) },
+                onTestModeChanged: { [weak self] leftSuppressed, rightSuppressed in
+                    self?.setTestModeSuppressed(leftSuppressed: leftSuppressed, rightSuppressed: rightSuppressed)
+                }
+            )
         }
         publishConnectionState()
-        startFusionStatusUpdates()
+        startLiveUpdates()
+        startTestPageUpdates()
         NSApp.activate(ignoringOtherApps: true)
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)

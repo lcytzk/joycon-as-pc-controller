@@ -53,6 +53,42 @@ final class ControllerMapper {
         refreshMapping()
     }
 
+    // MARK: - Test mode
+
+    private let testModeLock = NSLock()
+    private var testModeSuppressed = false
+
+    /// While this half's test page is open, every handler below still
+    /// publishes what the test page shows (held buttons, stick x/y, raw
+    /// gyro) but stops short of producing any real output — otherwise a
+    /// button press meant only to light up on screen would also fire
+    /// whatever it's actually bound to, system-wide, at the same time.
+    private var isTestModeSuppressed: Bool {
+        testModeLock.lock()
+        defer { testModeLock.unlock() }
+        return testModeSuppressed
+    }
+
+    /// Told by the settings window whenever its Left/Right Test tab becomes
+    /// (or stops being) the selected one, and unconditionally on window
+    /// close — so leaving the test page by any route restores real mapping.
+    func setTestModeSuppressed(_ suppressed: Bool) {
+        testModeLock.lock()
+        let changed = testModeSuppressed != suppressed
+        testModeSuppressed = suppressed
+        testModeLock.unlock()
+        guard changed else { return }
+        // Whatever a real press was mid-producing when the test page opened
+        // must not outlive that press — same cleanup `refreshMapping` does
+        // for a remap, for the same reason.
+        KeyboardOutput.shared.releaseAll(ownedBy: ObjectIdentifier(self))
+        inputLock.lock()
+        session.reset()
+        leftRotationTracker.reset()
+        rightRotationTracker.reset()
+        inputLock.unlock()
+    }
+
     private func refreshMapping() {
         // Snapshot the shared state before taking our own lock — the two are
         // never held at once, so there is no ordering to get wrong.
@@ -65,6 +101,8 @@ final class ControllerMapper {
         KeyboardOutput.shared.releaseAll(ownedBy: ObjectIdentifier(self))
         inputLock.lock()
         session.reset()
+        leftRotationTracker.reset()
+        rightRotationTracker.reset()
         inputLock.unlock()
         // The learned placement of the other IMU is relative to *these* axis
         // choices, so choosing again throws it away rather than carrying a
@@ -112,6 +150,8 @@ final class ControllerMapper {
             fn: combineState.fn,
             leftStick: profile.leftStick,
             rightStick: profile.rightStick,
+            leftStickRotation: combineState.leftStickRotation,
+            rightStickRotation: combineState.rightStickRotation,
             savedAlignment: profile.fusionAlignment,
             isCombined: true,
             isFused: profile.gyroSource == .fused
@@ -189,6 +229,72 @@ final class ControllerMapper {
         statusLock.unlock()
     }
 
+    private var storedLeftStickDebug = StickDebugState()
+    private var storedRightStickDebug = StickDebugState()
+
+    /// Live readout for the settings window: lets "is this stick even being
+    /// read" and "did that sweep actually register as a rotation step" be
+    /// answered by looking at a number instead of guessing from behaviour that
+    /// might just be a misconfigured profile.
+    var leftStickDebug: StickDebugState {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return storedLeftStickDebug
+    }
+    var rightStickDebug: StickDebugState {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return storedRightStickDebug
+    }
+
+    private func publishStickDebug(isLeft: Bool, x: Double, y: Double, addedSteps: Int) {
+        statusLock.lock()
+        if isLeft {
+            storedLeftStickDebug.x = x
+            storedLeftStickDebug.y = y
+            storedLeftStickDebug.rotationSteps += addedSteps
+        } else {
+            storedRightStickDebug.x = x
+            storedRightStickDebug.y = y
+            storedRightStickDebug.rotationSteps += addedSteps
+        }
+        statusLock.unlock()
+    }
+
+    private var storedHeldButtons: Set<String> = []
+    private var storedRawGyro = SIMD3<Double>()
+
+    /// Which of this controller's own buttons are down right now — for the
+    /// per-side test page, so a dead button shows up as "never highlights"
+    /// instead of a guess about whether the press even reached the app.
+    var heldButtons: Set<String> {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return storedHeldButtons
+    }
+
+    /// The gyro's raw x/y/z, deg/s, before axis selection or bias correction
+    /// — the same reason the test page shows raw stick x/y rather than
+    /// whatever a configured mode turns it into: a hardware problem should be
+    /// visible independent of how anything is currently mapped.
+    var rawGyro: SIMD3<Double> {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return storedRawGyro
+    }
+
+    private func publishHeldButton(_ name: String, isDown: Bool) {
+        statusLock.lock()
+        if isDown { storedHeldButtons.insert(name) } else { storedHeldButtons.remove(name) }
+        statusLock.unlock()
+    }
+
+    private func publishRawGyro(_ raw: SIMD3<Double>) {
+        statusLock.lock()
+        storedRawGyro = raw
+        statusLock.unlock()
+    }
+
     // Orientation accumulated since the activation button went down. Reset on
     // each press, so integration error never has more than one hold to build up in.
     private var gyroOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -210,6 +316,12 @@ final class ControllerMapper {
     /// `inputLock` like the rest of the shared input state.
     private var session = ButtonSession()
     private var diagnostics: GyroDiagnostics?
+
+    /// Circular-sweep tracking for the rotation-to-tab-switch gesture, one per
+    /// physical stick. Under `inputLock` like `session`: read and updated from
+    /// the IOHID thread, reset from whatever thread applies a config change.
+    private var leftRotationTracker = StickRotationTracker()
+    private var rightRotationTracker = StickRotationTracker()
 
     init(controller: JoyConSwift.Controller, config: AppConfig, combine: CombineCoordinator) {
         self.controller = controller
@@ -254,19 +366,23 @@ final class ControllerMapper {
         }
         controller.leftStickPosHandler = { [weak self] pos in
             guard let self = self else { return }
-            self.handleStickPos(pos, stick: self.mappingSnapshot().leftStick)
+            let mapping = self.mappingSnapshot()
+            self.handleStickPos(pos, stick: mapping.leftStick, rotation: mapping.leftStickRotation, isLeft: true)
         }
         controller.rightStickPosHandler = { [weak self] pos in
             guard let self = self else { return }
-            self.handleStickPos(pos, stick: self.mappingSnapshot().rightStick)
+            let mapping = self.mappingSnapshot()
+            self.handleStickPos(pos, stick: mapping.rightStick, rotation: mapping.rightStickRotation, isLeft: false)
         }
         controller.leftStickHandler = { [weak self] newDir, oldDir in
             guard let self = self else { return }
-            self.handleStickDirection(newDir, oldDir, stick: self.mappingSnapshot().leftStick, prefix: "lstick")
+            let mapping = self.mappingSnapshot()
+            self.handleStickDirection(newDir, oldDir, stick: mapping.leftStick, rotation: mapping.leftStickRotation, prefix: "lstick")
         }
         controller.rightStickHandler = { [weak self] newDir, oldDir in
             guard let self = self else { return }
-            self.handleStickDirection(newDir, oldDir, stick: self.mappingSnapshot().rightStick, prefix: "rstick")
+            let mapping = self.mappingSnapshot()
+            self.handleStickDirection(newDir, oldDir, stick: mapping.rightStick, rotation: mapping.rightStickRotation, prefix: "rstick")
         }
         controller.sensorHandler = { [weak self] in self?.handleGyro() }
     }
@@ -286,6 +402,11 @@ final class ControllerMapper {
     private func handleButton(_ button: JoyCon.Button, isDown: Bool) {
         let mapping = mappingSnapshot()
         let name = buttonNames[button]
+
+        // Independent of every mapping decision below — the test page needs
+        // to see a press even when nothing is bound to it.
+        if let name = name { publishHeldButton(name, isDown: isDown) }
+        guard !isTestModeSuppressed else { return }
 
         if let activation = mapping.gyro.activationButton, activation == button {
             // While both halves are connected the activation state is shared:
@@ -404,8 +525,15 @@ final class ControllerMapper {
         }
     }
 
-    private func handleStickDirection(_ newDir: JoyCon.StickDirection, _ oldDir: JoyCon.StickDirection, stick: StickConfig, prefix: String) {
+    private func handleStickDirection(_ newDir: JoyCon.StickDirection, _ oldDir: JoyCon.StickDirection, stick: StickConfig, rotation: StickRotationConfig, prefix: String) {
+        guard !isTestModeSuppressed else { return }
+        // The rotation gesture sweeps through all four cardinal positions on
+        // its way around, so Key mode's directional output is suppressed
+        // while the gesture actually owns the stick — which is only while an
+        // FN key is held — otherwise a sweep would fire both a tab switch and
+        // a burst of arrow keys. Outside that window Key mode plays normally.
         guard stick.mode == .key else { return }
+        if rotation.target != .off, !combine.fnEngagedKeys().isEmpty { return }
         let oldSet = cardinals(for: oldDir)
         let newSet = cardinals(for: newDir)
 
@@ -419,23 +547,99 @@ final class ControllerMapper {
 
     /// Accumulates only — the movement is posted by the render tick, so the
     /// cursor advances on a steady clock rather than in one jump per report.
-    private func handleStickPos(_ pos: CGPoint, stick: StickConfig) {
-        let speed = CGFloat(stick.speed)
-        switch stick.mode {
-        case .mouse:
-            guard pos.x != 0 || pos.y != 0 else { return }
+    private func handleStickPos(_ pos: CGPoint, stick: StickConfig, rotation: StickRotationConfig, isLeft: Bool) {
+        guard !isTestModeSuppressed else {
+            // Nothing left to clean up here: `setTestModeSuppressed` already
+            // released any held key and reset both trackers the moment
+            // suppression turned on. The test page still needs the raw x/y.
+            publishStickDebug(isLeft: isLeft, x: Double(pos.x), y: Double(pos.y), addedSteps: 0)
+            return
+        }
+
+        let holdIdentifier = outputKey(isLeft ? "lstick.rotate.hold" : "rstick.rotate.hold")
+        // Constant for the duration of one unchanged config, so it's safe to
+        // use for both press and release below — a config change that swaps
+        // this mid-gesture already goes through `refreshMapping`'s blanket
+        // `releaseAll` first, which clears `engaged` before this runs again.
+        let heldKey = rotation.target.heldKeyName
+        // Gated on an FN key actually being held, not just on `rotation`
+        // being configured — a bare circular sweep is common enough in
+        // ordinary play (aiming, menu navigation) that firing on it alone
+        // misfires regularly. Requiring FN turns it into a deliberate gesture.
+        let active = rotation.target != .off && !combine.fnEngagedKeys().isEmpty
+
+        guard active else {
+            // Mutually exclusive with the gesture: FN not held (or rotation
+            // off) means this stick is entirely Mode's — mouse/wheel/key —
+            // same as if the gesture didn't exist. The two never run together,
+            // so a right stick set to Wheel can't also dribble scroll events
+            // out from underneath an FN-held rotation sweep.
+            let speed = CGFloat(stick.speed)
+            switch stick.mode {
+            case .mouse:
+                if pos.x != 0 || pos.y != 0 {
+                    inputLock.lock()
+                    pendingMouseDx += pos.x * speed
+                    pendingMouseDy -= pos.y * speed // stick "up" is negative in CGEvent space
+                    inputLock.unlock()
+                }
+            case .wheel:
+                if pos.x != 0 || pos.y != 0 {
+                    inputLock.lock()
+                    pendingScrollX += pos.x * speed
+                    pendingScrollY += pos.y * speed
+                    inputLock.unlock()
+                }
+            case .key, .none:
+                break
+            }
+
             inputLock.lock()
-            pendingMouseDx += pos.x * speed
-            pendingMouseDy -= pos.y * speed // stick "up" is negative in CGEvent space
+            let wasEngaged = isLeft ? leftRotationTracker.engaged : rightRotationTracker.engaged
+            if isLeft { leftRotationTracker.reset() } else { rightRotationTracker.reset() }
             inputLock.unlock()
-        case .wheel:
-            guard pos.x != 0 || pos.y != 0 else { return }
-            inputLock.lock()
-            pendingScrollX += pos.x * speed
-            pendingScrollY += pos.y * speed
-            inputLock.unlock()
-        case .key, .none:
-            break
+            // Off (or FN let go, or the stick recentered right as either
+            // happened) mid-gesture — the held key must not outlive it.
+            if wasEngaged { KeyboardOutput.shared.release(heldKey, identifier: holdIdentifier) }
+            // Published even with the gesture inactive, so the settings
+            // window can confirm raw stick input is arriving before FN is
+            // even held.
+            publishStickDebug(isLeft: isLeft, x: Double(pos.x), y: Double(pos.y), addedSteps: 0)
+            return
+        }
+
+        inputLock.lock()
+        let wasEngaged = isLeft ? leftRotationTracker.engaged : rightRotationTracker.engaged
+        let steps = isLeft
+            ? leftRotationTracker.update(pos: pos, degreesPerStep: rotation.degreesPerStep)
+            : rightRotationTracker.update(pos: pos, degreesPerStep: rotation.degreesPerStep)
+        let nowEngaged = isLeft ? leftRotationTracker.engaged : rightRotationTracker.engaged
+        inputLock.unlock()
+        publishStickDebug(isLeft: isLeft, x: Double(pos.x), y: Double(pos.y), addedSteps: abs(steps))
+
+        // The chosen key goes down the moment the stick is pushed to the
+        // bottom (see `StickRotationTracker`'s anchor) and stays down for as
+        // long as the stick is still out — exactly like a person holding it
+        // and tapping Tab: Ctrl shows a browser's tab switcher, Cmd shows
+        // macOS's app switcher, both only committing once released. Letting
+        // go on every step (a full "ctrl+tab" tap each time) would never
+        // trigger that preview — it would just hop one at a time.
+        if nowEngaged && !wasEngaged {
+            KeyboardOutput.shared.press(heldKey, identifier: holdIdentifier)
+        } else if wasEngaged && !nowEngaged {
+            KeyboardOutput.shared.release(heldKey, identifier: holdIdentifier)
+        }
+
+        guard steps != 0 else { return }
+
+        // Forward (clockwise) is a bare Tab, matching a held switcher's
+        // default direction; backward (counter-clockwise) adds Shift for that
+        // one tap only — the held key underneath is untouched either way.
+        let tapKey = steps > 0 ? "shift+tab" : "tab"
+        let tapIdentifier = outputKey(isLeft ? "lstick.rotate.tap" : "rstick.rotate.tap")
+        for _ in 0..<abs(steps) {
+            KeyboardOutput.shared.press(tapKey, identifier: tapIdentifier)
+            KeyboardOutput.shared.release(tapKey, identifier: tapIdentifier)
         }
     }
 
@@ -459,12 +663,17 @@ final class ControllerMapper {
     /// three, ~15 ms apart. Summing here and averaging per render tick decimates
     /// the burst properly instead of aliasing it into the cursor.
     private func handleGyro() {
+        let gyro = controller.gyro
+        let raw = SIMD3<Double>(Double(gyro.x), Double(gyro.y), Double(gyro.z))
+        // Ahead of every mapping decision below, same as the button state
+        // above — the test page needs to see this even with gyro-to-mouse
+        // turned off, since that's routinely the state it's used to debug.
+        publishRawGyro(raw)
+        guard !isTestModeSuppressed else { return }
+
         let mapping = mappingSnapshot()
         let runtime = mapping.gyro
         guard runtime.enabled, mapping.role != .off else { return }
-
-        let gyro = controller.gyro
-        let raw = SIMD3<Double>(Double(gyro.x), Double(gyro.y), Double(gyro.z))
 
         // A contributor hands over its axes untouched — which of them answers
         // to horizontal and vertical is the driver's to work out, and its own
@@ -819,6 +1028,98 @@ final class ControllerMapper {
     }
 }
 
+/// Live stick reading for the settings window's debug readout — not used by
+/// the mapping logic itself, which reads the raw `CGPoint` directly.
+struct StickDebugState {
+    var x: Double = 0
+    var y: Double = 0
+    /// Cumulative count of rotation steps fired, so a slow deliberate sweep
+    /// can be confirmed to have registered without having to watch a browser
+    /// tab bar at the same time as the controller.
+    var rotationSteps: Int = 0
+}
+
+/// Turns the stick being swept in a circle into discrete steps. Arming needs
+/// a full push (any direction — the FN hold this is already gated behind is
+/// what rules out an accident, so there's no anchor angle to also require),
+/// and once armed a much smaller push is enough to keep going. Direction is
+/// meaningless near center, so no angle is trusted below that floor either
+/// way. `degreesPerStep` defaults to a full quarter turn rather than
+/// something twitchier, so a slow, deliberate sweep can be walked one tab at
+/// a time instead of skipping several from a quick flick.
+struct StickRotationTracker {
+    /// Whether the gesture is currently mid-sweep. The caller holds the
+    /// chosen key down for exactly as long as this is true, so it's read
+    /// before and after every `update`.
+    private(set) var engaged = false
+    private var lastAngle: Double?
+    private var accumulatedDegrees: Double = 0
+
+    /// Once engaged, the gesture ends here regardless of where it started —
+    /// easing off doesn't have to mean easing all the way back to the anchor.
+    /// Set well below `anchorMagnitude` on purpose: a real sweep's magnitude
+    /// dips as it crosses toward a diagonal (the stick's travel isn't a
+    /// perfect circle) and a hand mid-gesture relaxes a little without
+    /// meaning to let go. If this sat close to `anchorMagnitude`, either one
+    /// would drop below it, disengage, and then re-arm on the very next
+    /// sample — each re-arm firing its own free anchor tick, which is exactly
+    /// what "fires several times in a row for one sweep" looks like.
+    private let disengageMagnitude: Double = 0.3
+    /// Arming needs a deliberate full push, not just past the disengage
+    /// threshold — direction doesn't matter (no anchor angle to hit) since
+    /// the FN hold already rules out an incidental nudge; this just tells a
+    /// real push from a half-hearted one.
+    private let anchorMagnitude: Double = 0.85
+
+    /// Positive return = counter-clockwise steps crossed this update,
+    /// negative = clockwise. Ordinarily -1, 0, or 1 — except the very update
+    /// that arms the gesture, which always returns exactly -1: the push
+    /// that arms it is itself the first (forward) tick, not just the
+    /// starting line. `degreesPerStep` comes from `StickConfig` rather than
+    /// being fixed here — floored well above zero so a stray 0 or negative
+    /// typed into Settings can't spin this into an infinite loop.
+    mutating func update(pos: CGPoint, degreesPerStep: Double) -> Int {
+        let step = max(degreesPerStep, 5)
+        let magnitude = (Double(pos.x) * Double(pos.x) + Double(pos.y) * Double(pos.y)).squareRoot()
+        guard magnitude >= disengageMagnitude else {
+            reset()
+            return 0
+        }
+
+        let angle = atan2(Double(pos.y), Double(pos.x))
+
+        guard engaged else {
+            guard magnitude >= anchorMagnitude else { return 0 }
+            engaged = true
+            lastAngle = angle
+            return -1
+        }
+
+        defer { lastAngle = angle }
+        guard let last = lastAngle else { return 0 }
+
+        // Shortest-path delta: a rotation can't cover more than half a turn
+        // between two samples a few milliseconds apart, so wrapping this way
+        // rather than taking the raw difference is always the right choice,
+        // not just a tie-break.
+        var delta = angle - last
+        if delta > .pi { delta -= 2 * .pi }
+        if delta < -.pi { delta += 2 * .pi }
+        accumulatedDegrees += delta * 180 / .pi
+
+        var steps = 0
+        while accumulatedDegrees >= step { accumulatedDegrees -= step; steps += 1 }
+        while accumulatedDegrees <= -step { accumulatedDegrees += step; steps -= 1 }
+        return steps
+    }
+
+    mutating func reset() {
+        engaged = false
+        lastAngle = nil
+        accumulatedDegrees = 0
+    }
+}
+
 /// The hot subset of `GyroConfig`, resolved once per config change so the
 /// sample path never walks dictionaries or does string lookups.
 /// What a controller is currently mapped to: the button bindings in force, the
@@ -831,6 +1132,11 @@ struct ActiveMapping {
     var fn: FnConfig = FnConfig()
     var leftStick: StickConfig = StickConfig()
     var rightStick: StickConfig = StickConfig()
+    /// Defaults to `.off` outside Combine, same as `fn` itself: the whole
+    /// gesture is gated on an FN key, which only exists once both halves are
+    /// connected — see `StickRotationConfig`.
+    var leftStickRotation: StickRotationConfig = StickRotationConfig()
+    var rightStickRotation: StickRotationConfig = StickRotationConfig()
     /// A calibration saved in the profile, if there is one. Its presence is
     /// what spares the user having to wave the grip about at every launch.
     var savedAlignment: FusionAlignment?

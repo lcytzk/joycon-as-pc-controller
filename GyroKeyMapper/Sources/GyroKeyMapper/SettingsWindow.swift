@@ -47,6 +47,9 @@ private struct StickControls {
     let keyFields: [String: NSTextField] = [
         "up": NSTextField(), "down": NSTextField(), "left": NSTextField(), "right": NSTextField(),
     ]
+    /// Live x/y and a running count of rotation steps fired, updated while
+    /// Settings is open — see `SettingsWindowController.updateStickDebugState`.
+    let debugLabel = NSTextField(labelWithString: "live: waiting for input…")
 }
 
 /// One gyro section's controls — see `StickControls`. A class rather than a
@@ -105,6 +108,12 @@ private final class FnControls {
     let layersStack = NSStackView()
     let addLayerButton = NSButton(title: "+ Add FN Key", target: nil, action: nil)
     var layers: [FnLayerControls] = []
+    /// Rotate-to-switch only fires while an FN key is held — see
+    /// `StickRotationConfig`. One popup + degrees field per physical stick.
+    let leftRotationPopup = NSPopUpButton()
+    let leftRotationDegreesField = NSTextField()
+    let rightRotationPopup = NSPopUpButton()
+    let rightRotationDegreesField = NSTextField()
     /// Everything below the enable checkbox, so it can be dimmed as a unit.
     weak var body: NSStackView?
 }
@@ -118,6 +127,53 @@ private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// A dot inside a circle, at the stick's raw x/y (each roughly -1...1) — the
+/// classic gamepad-tester deflection view. Deliberately *not* flipped: +y
+/// staying "up" on screen is what makes pushing the stick up read as
+/// intuitive, and that only holds in AppKit's default bottom-left-origin
+/// coordinate space.
+private final class StickIndicatorView: NSView {
+    var position: CGPoint = .zero { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let radius = min(bounds.width, bounds.height) / 2 - 6
+
+        ctx.setStrokeColor(NSColor.separatorColor.cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.strokeEllipse(in: CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2))
+
+        ctx.setStrokeColor(NSColor.tertiaryLabelColor.cgColor)
+        ctx.setLineWidth(1)
+        ctx.move(to: CGPoint(x: center.x - radius, y: center.y))
+        ctx.addLine(to: CGPoint(x: center.x + radius, y: center.y))
+        ctx.move(to: CGPoint(x: center.x, y: center.y - radius))
+        ctx.addLine(to: CGPoint(x: center.x, y: center.y + radius))
+        ctx.strokePath()
+
+        let clampedX = max(-1, min(1, position.x))
+        let clampedY = max(-1, min(1, position.y))
+        let magnitude = (position.x * position.x + position.y * position.y).squareRoot()
+        let dotCenter = CGPoint(x: center.x + clampedX * radius, y: center.y + clampedY * radius)
+        let dotRadius: CGFloat = 5
+        // Green once past the rotation gesture's own deadzone, so this
+        // doubles as "is my push even registering as one" without leaving
+        // this page.
+        ctx.setFillColor((magnitude >= 0.5 ? NSColor.systemGreen : NSColor.systemBlue).cgColor)
+        ctx.fillEllipse(in: CGRect(x: dotCenter.x - dotRadius, y: dotCenter.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2))
+    }
+}
+
+/// One side's diagnostic page controls — button highlight labels keyed by
+/// name, the stick's live dot, and a raw gyro readout.
+private final class TestPageControls {
+    var buttonLabels: [String: NSTextField] = [:]
+    let stickIndicator = StickIndicatorView()
+    let stickText = NSTextField(labelWithString: "")
+    let gyroText = NSTextField(labelWithString: "")
+}
+
 /// A settings window built entirely in code (no Storyboard/XIB), so it needs
 /// only the Swift compiler to build — no Xcode required.
 ///
@@ -126,9 +182,14 @@ private final class FlippedView: NSView {
 /// fields that don't yet parse to a known key are simply left out of the
 /// saved config (and shown in red) rather than popping a blocking alert,
 /// since that would fire on every half-typed keystroke.
-final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate, NSTabViewDelegate {
     private var config: AppConfig
     private let onSave: (AppConfig) -> Void
+    /// Told whenever the Left/Right Test tab becomes (or stops being) the
+    /// selected one, so real output can be suppressed only while that
+    /// controller's test page is actually on screen. Both false covers every
+    /// other tab and is also forced on window close.
+    private let onTestModeChanged: (_ leftSuppressed: Bool, _ rightSuppressed: Bool) -> Void
 
     private var buttonRows: [ButtonRow] = []
     // FN gets its own tab rather than a section on an existing page: a
@@ -140,6 +201,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private let rightStickControls = StickControls()
     private let leftGyroControls = GyroControls()
     private let rightGyroControls = GyroControls()
+    private let leftTestControls = TestPageControls()
+    private let rightTestControls = TestPageControls()
     // Combine has its own independent left/right gyro pair — three fully
     // separate contexts (standalone left, standalone right, combine), since
     // combined operation is meant to feel different from either controller
@@ -198,9 +261,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var recordingHeldModifierFlags: NSEvent.ModifierFlags = []
     private var recordingCapturedKeyOrder: [CGKeyCode] = []
 
-    init(config: AppConfig, onSave: @escaping (AppConfig) -> Void) {
+    init(
+        config: AppConfig, onSave: @escaping (AppConfig) -> Void,
+        onTestModeChanged: @escaping (_ leftSuppressed: Bool, _ rightSuppressed: Bool) -> Void
+    ) {
         self.config = config
         self.onSave = onSave
+        self.onTestModeChanged = onTestModeChanged
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 620),
@@ -228,6 +295,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         let tabView = NSTabView()
         tabView.translatesAutoresizingMaskIntoConstraints = false
+        tabView.delegate = self
 
         let leftItem = NSTabViewItem(identifier: "left")
         leftItem.label = "Left Joy-Con"
@@ -245,10 +313,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnItem.label = "Combine FN"
         fnItem.view = buildScrollablePage(buildFnPage())
 
+        let leftTestItem = NSTabViewItem(identifier: "leftTest")
+        leftTestItem.label = "Left Test"
+        leftTestItem.view = buildScrollablePage(buildTestPage(buttonNames: leftJoyConButtons, controls: leftTestControls))
+
+        let rightTestItem = NSTabViewItem(identifier: "rightTest")
+        rightTestItem.label = "Right Test"
+        rightTestItem.view = buildScrollablePage(buildTestPage(buttonNames: rightJoyConButtons, controls: rightTestControls))
+
         tabView.addTabViewItem(leftItem)
         tabView.addTabViewItem(rightItem)
         tabView.addTabViewItem(combineItem)
         tabView.addTabViewItem(fnItem)
+        tabView.addTabViewItem(leftTestItem)
+        tabView.addTabViewItem(rightTestItem)
 
         contentView.addSubview(tabView)
         NSLayoutConstraint.activate([
@@ -346,6 +424,35 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnControls.addLayerButton.action = #selector(addFnLayer(_:))
         body.addArrangedSubview(fnControls.addLayerButton)
 
+        let rotationStack = NSStackView()
+        rotationStack.orientation = .vertical
+        rotationStack.alignment = .leading
+        rotationStack.spacing = 6
+        rotationStack.addArrangedSubview(sectionTitle("Rotate Stick While FN Held"))
+        rotationStack.addArrangedSubview(hintLabel("While any FN key is held, push the stick all the way out in any direction — that push is itself the first switch. From there, keep sweeping: clockwise taps Tab, counter-clockwise taps Shift+Tab, once per Degrees/switch of further rotation. The chosen key stays down until the stick is back to center. Off outside an FN hold, so ordinary play (aiming, menus) can't misfire it.", lines: 5, width: 460))
+
+        fnControls.leftRotationPopup.addItems(withTitles: ["Off", "Ctrl+Tab (browser tabs)", "Option+Tab", "Cmd+Tab (app switcher)"])
+        fnControls.leftRotationPopup.target = self
+        fnControls.leftRotationPopup.action = #selector(settingsChanged(_:))
+        fnControls.leftRotationDegreesField.delegate = self
+        fnControls.leftRotationDegreesField.widthAnchor.constraint(equalToConstant: 50).isActive = true
+        rotationStack.addArrangedSubview(row([
+            labeled("Left Stick", width: 80), fnControls.leftRotationPopup,
+            labeled("Degrees/switch"), fnControls.leftRotationDegreesField,
+        ]))
+
+        fnControls.rightRotationPopup.addItems(withTitles: ["Off", "Ctrl+Tab (browser tabs)", "Option+Tab", "Cmd+Tab (app switcher)"])
+        fnControls.rightRotationPopup.target = self
+        fnControls.rightRotationPopup.action = #selector(settingsChanged(_:))
+        fnControls.rightRotationDegreesField.delegate = self
+        fnControls.rightRotationDegreesField.widthAnchor.constraint(equalToConstant: 50).isActive = true
+        rotationStack.addArrangedSubview(row([
+            labeled("Right Stick", width: 80), fnControls.rightRotationPopup,
+            labeled("Degrees/switch"), fnControls.rightRotationDegreesField,
+        ]))
+
+        body.addArrangedSubview(rotationStack)
+
         // Live feedback, because everything else on this page is a guess until
         // you can see whether a hold actually registered.
         fnControls.liveLabel.isSelectable = false
@@ -356,6 +463,58 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         updateFnState(engaged: nil, combined: false)
 
         mainStack.addArrangedSubview(body)
+        return mainStack
+    }
+
+    /// A raw hardware check, independent of whatever is currently bound:
+    /// every button on this half, the stick's live deflection, and the
+    /// gyro's raw rate — so "is this Joy-Con just worn out" can be answered
+    /// by looking rather than by inference from mapped behaviour.
+    private func buildTestPage(buttonNames: [String], controls: TestPageControls) -> NSView {
+        let mainStack = NSStackView()
+        mainStack.orientation = .vertical
+        mainStack.alignment = .leading
+        mainStack.spacing = 16
+
+        mainStack.addArrangedSubview(hintLabel("Press and hold each button — a dead one never highlights. At rest, a healthy stick's dot sits dead center and a healthy gyro reads near 0 deg/s on all three axes; drift or noise here is the controller, not the mapping.", lines: 3, width: 460))
+
+        let buttonsStack = NSStackView()
+        buttonsStack.orientation = .vertical
+        buttonsStack.alignment = .leading
+        buttonsStack.spacing = 4
+        buttonsStack.addArrangedSubview(sectionTitle("Buttons"))
+        for name in buttonNames {
+            let stateLabel = NSTextField(labelWithString: "")
+            stateLabel.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
+            stateLabel.widthAnchor.constraint(equalToConstant: 80).isActive = true
+            controls.buttonLabels[name] = stateLabel
+            buttonsStack.addArrangedSubview(row([labeled(name, width: 90), stateLabel]))
+        }
+        mainStack.addArrangedSubview(buttonsStack)
+
+        let stickStack = NSStackView()
+        stickStack.orientation = .vertical
+        stickStack.alignment = .leading
+        stickStack.spacing = 6
+        stickStack.addArrangedSubview(sectionTitle("Stick"))
+        controls.stickIndicator.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        controls.stickIndicator.heightAnchor.constraint(equalToConstant: 140).isActive = true
+        stickStack.addArrangedSubview(controls.stickIndicator)
+        controls.stickText.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        controls.stickText.textColor = .secondaryLabelColor
+        stickStack.addArrangedSubview(controls.stickText)
+        mainStack.addArrangedSubview(stickStack)
+
+        let gyroStack = NSStackView()
+        gyroStack.orientation = .vertical
+        gyroStack.alignment = .leading
+        gyroStack.spacing = 6
+        gyroStack.addArrangedSubview(sectionTitle("Gyro — raw, deg/s"))
+        controls.gyroText.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        controls.gyroText.textColor = .secondaryLabelColor
+        gyroStack.addArrangedSubview(controls.gyroText)
+        mainStack.addArrangedSubview(gyroStack)
+
         return mainStack
     }
 
@@ -683,6 +842,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             stack.addArrangedSubview(row([labeled(direction.capitalized, width: 70), field, recordButton(for: field)]))
         }
 
+        stack.addArrangedSubview(hintLabel("Rotate-to-switch-tabs lives on the FN tab now — sweeping this stick in a circle only does something while an FN key is held, so configure it there.", width: 380))
+
+        stick.debugLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        stick.debugLabel.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(stick.debugLabel)
+
         return stack
     }
 
@@ -747,6 +912,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private func loadFromConfig() {
         isReloading = true
         loadFn(config.combine.fn)
+        loadStickRotation(config.combine.leftStickRotation, into: fnControls.leftRotationPopup, field: fnControls.leftRotationDegreesField)
+        loadStickRotation(config.combine.rightStickRotation, into: fnControls.rightRotationPopup, field: fnControls.rightRotationDegreesField)
         loadButtons(config.buttons, into: buttonRows)
         loadStick(config.leftStick, into: leftStickControls)
         loadStick(config.rightStick, into: rightStickControls)
@@ -872,6 +1039,30 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         return FnConfig(enabled: fnControls.enabledCheckbox.state == .on, layers: layers)
     }
 
+    private func loadStickRotation(_ rotation: StickRotationConfig, into popup: NSPopUpButton, field: NSTextField) {
+        switch rotation.target {
+        case .off: popup.selectItem(at: 0)
+        case .ctrl: popup.selectItem(at: 1)
+        case .option: popup.selectItem(at: 2)
+        case .command: popup.selectItem(at: 3)
+        }
+        field.stringValue = String(rotation.degreesPerStep)
+    }
+
+    private func readStickRotation(popup: NSPopUpButton, field: NSTextField) -> StickRotationConfig {
+        let target: StickRotationTarget
+        switch popup.indexOfSelectedItem {
+        case 1: target = .ctrl
+        case 2: target = .option
+        case 3: target = .command
+        default: target = .off
+        }
+        // Floored the same way the tracker floors it, so what's displayed
+        // matches what's actually in effect rather than silently diverging.
+        let degreesPerStep = max(5, Double(field.stringValue) ?? 90)
+        return StickRotationConfig(target: target, degreesPerStep: degreesPerStep)
+    }
+
     private func loadStick(_ stick: StickConfig, into controls: StickControls) {
         switch stick.mode {
         case .none: controls.modePopup.selectItem(at: 0)
@@ -920,6 +1111,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         var combine = config.combine
         combine.mode = combineMode
         combine.fn = readFn()
+        combine.leftStickRotation = readStickRotation(popup: fnControls.leftRotationPopup, field: fnControls.leftRotationDegreesField)
+        combine.rightStickRotation = readStickRotation(popup: fnControls.rightRotationPopup, field: fnControls.rightRotationDegreesField)
         combine[combineMode] = readCombineProfile()
         newConfig.combine = combine
 
@@ -980,7 +1173,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
                 keys[direction] = ButtonAction(key: text, mouseButton: nil)
             }
         }
-        return StickConfig(mode: mode, speed: Double(controls.speedField.stringValue) ?? 10.0, keys: keys)
+        return StickConfig(
+            mode: mode,
+            speed: Double(controls.speedField.stringValue) ?? 10.0,
+            keys: keys
+        )
     }
 
     private func readGyro(_ controls: GyroControls) -> GyroConfig {
@@ -1119,6 +1316,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     func windowWillClose(_ notification: Notification) {
         stopRecording()
+        // Belt and suspenders alongside the tab-switch handler below: closing
+        // the window while a test tab happens to be selected must not leave
+        // that controller's real output suppressed with no tab left to leave.
+        onTestModeChanged(false, false)
+    }
+
+    // MARK: - NSTabViewDelegate
+
+    /// Real output is suppressed only while a Left/Right Test tab is the one
+    /// actually on screen — everything else (including switching to a
+    /// different tab) restores it.
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        let identifier = tabViewItem?.identifier as? String
+        onTestModeChanged(identifier == "leftTest", identifier == "rightTest")
     }
 
     // MARK: - NSTextFieldDelegate
@@ -1310,6 +1521,63 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         saveCalibrationButton.isEnabled = !latestLearnedAlignment.isEmpty
             && latestLearnedAlignment != combineSavedAlignment
         clearCalibrationButton.isEnabled = combineSavedAlignment.map { !$0.isEmpty } ?? false
+    }
+
+    /// Live x/y plus a running rotation-step count, so "did I actually enable
+    /// this on the profile that's running" and "is my sweep even wide enough"
+    /// can be answered by watching a number instead of guessing from behaviour.
+    /// `nil` means that physical stick's controller isn't connected right now.
+    func updateStickDebugState(left: StickDebugState?, right: StickDebugState?) {
+        applyStickDebug(left, to: leftStickControls, combineControls: combineLeftStickControls)
+        applyStickDebug(right, to: rightStickControls, combineControls: combineRightStickControls)
+    }
+
+    private func applyStickDebug(_ state: StickDebugState?, to controls: StickControls, combineControls: StickControls) {
+        let text: String
+        let color: NSColor
+        if let state = state {
+            let engaged = (state.x * state.x + state.y * state.y).squareRoot() >= 0.5
+            text = String(format: "live: x=%+.2f y=%+.2f%@  |  rotations fired: %d",
+                           state.x, state.y, engaged ? " (past deadzone)" : "", state.rotationSteps)
+            color = engaged ? .systemGreen : .secondaryLabelColor
+        } else {
+            text = "live: not connected"
+            color = .secondaryLabelColor
+        }
+        for label in [controls.debugLabel, combineControls.debugLabel] {
+            label.stringValue = text
+            label.textColor = color
+        }
+    }
+
+    /// One side's diagnostic page: which buttons are down, the stick's live
+    /// dot, and the gyro's raw rate. `nil` means that controller isn't
+    /// connected — shown as such rather than left on stale numbers.
+    func updateTestPage(isLeft: Bool, held: Set<String>, stick: StickDebugState?, gyro: SIMD3<Double>?) {
+        let controls = isLeft ? leftTestControls : rightTestControls
+
+        for (name, label) in controls.buttonLabels {
+            if held.contains(name) {
+                label.stringValue = "● held"
+                label.textColor = .systemGreen
+            } else {
+                label.stringValue = ""
+            }
+        }
+
+        if let stick = stick {
+            controls.stickIndicator.position = CGPoint(x: stick.x, y: stick.y)
+            controls.stickText.stringValue = String(format: "x=%+.2f  y=%+.2f", stick.x, stick.y)
+        } else {
+            controls.stickIndicator.position = .zero
+            controls.stickText.stringValue = "not connected"
+        }
+
+        if let gyro = gyro {
+            controls.gyroText.stringValue = String(format: "x=%+6.1f  y=%+6.1f  z=%+6.1f", gyro.x, gyro.y, gyro.z)
+        } else {
+            controls.gyroText.stringValue = "not connected"
+        }
     }
 
     /// Shows whether an FN key is being held right now. Hold one while this

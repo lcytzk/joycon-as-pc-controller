@@ -25,12 +25,17 @@ final class CombineCoordinator {
         var profile = CombineProfile()
         /// Shared across holding modes — see `CombineConfig.fn`.
         var fn = FnConfig()
+        /// Same reasoning as `fn` — see `StickRotationConfig`.
+        var leftStickRotation = StickRotationConfig()
+        var rightStickRotation = StickRotationConfig()
     }
 
     private let lock = NSLock()
     private var isCombined = false
     private var profile = CombineProfile()
     private var fn = FnConfig()
+    private var leftStickRotation = StickRotationConfig()
+    private var rightStickRotation = StickRotationConfig()
 
     // Activation lives here rather than per-mapper because the button that
     // arms a fused gyro can sit on either half — in a grip the pair is one
@@ -55,18 +60,27 @@ final class CombineCoordinator {
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(isCombined: isCombined, profile: profile, fn: fn)
+        return Snapshot(
+            isCombined: isCombined, profile: profile, fn: fn,
+            leftStickRotation: leftStickRotation, rightStickRotation: rightStickRotation
+        )
     }
 
     /// Called when a controller connects or disconnects, or the profile is
     /// edited. Anything carried over from the previous arrangement — a
     /// half-full bus, an activation that was held when the other half went
     /// away — describes a setup that no longer exists, so it goes.
-    func update(isCombined: Bool, profile: CombineProfile, fn: FnConfig) {
+    func update(
+        isCombined: Bool, profile: CombineProfile, fn: FnConfig,
+        leftStickRotation: StickRotationConfig = StickRotationConfig(),
+        rightStickRotation: StickRotationConfig = StickRotationConfig()
+    ) {
         lock.lock()
         self.isCombined = isCombined
         self.profile = profile
         self.fn = fn
+        self.leftStickRotation = leftStickRotation
+        self.rightStickRotation = rightStickRotation
         activationHeld = false
         needsRecenter = false
         busSum = SIMD3<Double>()
