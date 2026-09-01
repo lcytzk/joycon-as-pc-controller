@@ -49,8 +49,11 @@ private struct StickControls {
     ]
 }
 
-/// One side's gyro controls — see `StickControls`.
-private struct GyroControls {
+/// One gyro section's controls — see `StickControls`. A class rather than a
+/// struct because `buildGyroSection` records the rows it builds here, so the
+/// Combine page can later hide or dim parts of a section without having to
+/// re-derive them from the view hierarchy.
+private final class GyroControls {
     let enabledCheckbox = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
     let sensitivityField = NSTextField()
     let smoothingSlider = NSSlider(value: 0.5, minValue: 0, maxValue: 1, target: nil, action: nil)
@@ -62,6 +65,9 @@ private struct GyroControls {
     // Mutually exclusive with each other: a button either activates the gyro
     // mouse while held, or toggles it on/off with a click.
     let activationModePopup = NSPopUpButton()
+
+    /// The section as a whole, so it can be hidden or dimmed in one go.
+    weak var sectionView: NSStackView?
 }
 
 /// A plain NSButton that remembers which text field it should fill in when
@@ -103,11 +109,45 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     // used alone.
     private let combineLeftGyroControls = GyroControls()
     private let combineRightGyroControls = GyroControls()
-    private let combineModePopup = NSPopUpButton()
+    // Tuning for the single trajectory fused from both IMUs.
+    private let combineFusedGyroControls = GyroControls()
+    private let combineLeftStickControls = StickControls()
+    private let combineRightStickControls = StickControls()
     // Combine's own button mapping — independent from `buttonRows` above.
     // Using both Joy-Cons together can reasonably want different bindings
     // than either alone, so this isn't just a read-only mirror.
     private var combineButtonRows: [ButtonRow] = []
+
+    // The Combine page shows one holding-mode profile at a time. This is which
+    // one — the controls below it are that profile's, and everything read out
+    // of them is written back to it.
+    private var combineMode: CombineMode = .separate
+    private let combineModeSegmented = NSSegmentedControl(
+        labels: ["Held Separately", "Mounted in Grip"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private var combineSourceRadios: [CombineGyroSource: NSButton] = [:]
+    private var combineFusedRadioHint: NSTextField?
+    private let combineStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private let combineFusionStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private let saveCalibrationButton = NSButton(title: "Save Calibration", target: nil, action: nil)
+    private let clearCalibrationButton = NSButton(title: "Clear", target: nil, action: nil)
+    /// The calibration stored in the profile on screen, if any. There is no
+    /// control that edits it directly — it is captured from the running
+    /// alignment — so it rides along here between load and commit.
+    private var combineSavedAlignment: FusionAlignment?
+    /// The latest live-learned alignment, pushed in by `AppController`.
+    private var latestLearnedAlignment = FusionAlignment()
+    private let copyFromOtherModeButton = NSButton(title: "Copy from Other Mode", target: nil, action: nil)
+
+    /// Set while controls are being filled in from a config, so the autosave
+    /// path stays out of the way. Programmatic setters mostly don't fire their
+    /// action, but a text field with an active field editor is the exception —
+    /// and switching profiles with a key field focused would otherwise write
+    /// the incoming profile's values straight back over the outgoing one.
+    private var isReloading = false
 
     // Key-recording state: click "Record" next to a field, then press a real
     // key (or key combo) on the keyboard instead of typing its name.
@@ -238,50 +278,148 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     /// Settings that only matter when both Joy-Cons are connected at once.
-    /// Buttons and sticks already work identically either way (see
-    /// leftJoyConButtons/rightJoyConButtons above), so this page only adds a
-    /// third gyro profile — for the case where the two controllers are one
-    /// rigid body (grip-mounted) rather than two independent ones.
+    ///
+    /// The page is a *profile editor*: the holding-mode control at the top
+    /// picks which of the two stored profiles everything below it belongs to,
+    /// rather than toggling a single behavior flag. That is why it is a
+    /// segmented control and not another popup in the list — it governs the
+    /// whole page, including the button mapping.
     private func buildCombinePage() -> NSView {
         let mainStack = NSStackView()
         mainStack.orientation = .vertical
         mainStack.alignment = .leading
         mainStack.spacing = 20
 
-        let copyStack = NSStackView()
-        copyStack.orientation = .vertical
-        copyStack.alignment = .leading
-        copyStack.spacing = 4
-        let copyButton = NSButton(title: "Copy Settings", target: self, action: #selector(copyCombineFromStandalone))
-        let copyHint = labeled("Copies the Left/Right Joy-Con tabs' buttons and gyro tuning here (each into its matching side) as a starting point to fine-tune.")
-        copyHint.textColor = .secondaryLabelColor
-        copyHint.maximumNumberOfLines = 2
-        copyHint.preferredMaxLayoutWidth = 380
-        copyStack.addArrangedSubview(copyButton)
-        copyStack.addArrangedSubview(copyHint)
-        mainStack.addArrangedSubview(copyStack)
+        combineStatusLabel.isSelectable = false
+        combineStatusLabel.maximumNumberOfLines = 2
+        combineStatusLabel.preferredMaxLayoutWidth = 400
+        combineStatusLabel.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        mainStack.addArrangedSubview(combineStatusLabel)
+        updateConnectionState(leftConnected: false, rightConnected: false)
 
         let modeStack = NSStackView()
         modeStack.orientation = .vertical
         modeStack.alignment = .leading
         modeStack.spacing = 6
-        modeStack.addArrangedSubview(sectionTitle("Mode"))
-        combineModePopup.addItems(withTitles: ["Held Separately", "Mounted in Grip"])
-        combineModePopup.target = self
-        combineModePopup.action = #selector(settingsChanged(_:))
-        modeStack.addArrangedSubview(combineModePopup)
-        let modeHint = labeled("Only changes how the gyro sections below are handled at runtime. \"Mounted in Grip\" means sampling both IMUs at once and fusing them into one optimized trajectory — not wired up yet, so picking it has no effect on the cursor.")
-        modeHint.textColor = .secondaryLabelColor
-        modeHint.maximumNumberOfLines = 3
-        modeHint.preferredMaxLayoutWidth = 380
-        modeStack.addArrangedSubview(modeHint)
+        modeStack.addArrangedSubview(sectionTitle("Holding Mode"))
+        combineModeSegmented.target = self
+        combineModeSegmented.action = #selector(combineModeChanged(_:))
+        combineModeSegmented.selectedSegment = 0
+        modeStack.addArrangedSubview(combineModeSegmented)
+        modeStack.addArrangedSubview(hintLabel("Each mode keeps its own buttons, sticks and gyro settings. Switching only changes which set this page shows and edits — the other one keeps everything it had.", lines: 3))
         mainStack.addArrangedSubview(modeStack)
 
+        let copyStack = NSStackView()
+        copyStack.orientation = .vertical
+        copyStack.alignment = .leading
+        copyStack.spacing = 4
+        let copyButton = NSButton(title: "Copy from Left/Right Tabs", target: self, action: #selector(copyCombineFromStandalone))
+        copyFromOtherModeButton.target = self
+        copyFromOtherModeButton.action = #selector(copyCombineFromOtherMode)
+        copyStack.addArrangedSubview(row([copyButton, copyFromOtherModeButton]))
+        copyStack.addArrangedSubview(hintLabel("Seeds the profile currently shown — buttons, sticks and gyro — as a starting point to fine-tune.", lines: 3))
+        mainStack.addArrangedSubview(copyStack)
+
+        let sourceStack = NSStackView()
+        sourceStack.orientation = .vertical
+        sourceStack.alignment = .leading
+        sourceStack.spacing = 8
+        sourceStack.addArrangedSubview(sectionTitle("Gyro Source"))
+        sourceStack.addArrangedSubview(gyroSourceOption(
+            .left, title: "Left Joy-Con only",
+            hint: "The right Joy-Con's gyro stays off; its buttons and stick work as normal."
+        ))
+        sourceStack.addArrangedSubview(gyroSourceOption(
+            .right, title: "Right Joy-Con only",
+            hint: "The left Joy-Con's gyro stays off; its buttons and stick work as normal."
+        ))
+        let fusedOption = gyroSourceOption(
+            .fused, title: "Both, fused — needs the grip",
+            hint: "One gyro, fed by both IMUs: they cover each other's dropped reports and agree on when the pair is still, so aim holds steadier. Configured as a single gyro below — the second Joy-Con places itself. Only valid when the two are one rigid body; don't pick this holding them one per hand."
+        )
+        sourceStack.addArrangedSubview(fusedOption)
+        mainStack.addArrangedSubview(sourceStack)
+
         mainStack.addArrangedSubview(buildButtonsSection(names: leftJoyConButtons + rightJoyConButtons, rows: &combineButtonRows))
+        // Both halves' sticks, for the same reason the buttons are here: a
+        // stick can want a different job in a grip than it does held alone.
+        // Unaffected by Gyro Source — that only arbitrates the gyros.
+        mainStack.addArrangedSubview(buildStickSection(stick: combineLeftStickControls, title: "Left Stick"))
+        mainStack.addArrangedSubview(buildStickSection(stick: combineRightStickControls, title: "Right Stick"))
+
+        // Either half's button can arm the fused gyro — in a grip they are one
+        // device as far as the hands are concerned.
+        let fusedSection = buildGyroSection(
+            gyro: combineFusedGyroControls,
+            activationButtonNames: leftJoyConButtons + rightJoyConButtons,
+            title: "Fused Gyro"
+        )
+        mainStack.addArrangedSubview(fusedSection)
+        // Tune this exactly as you would a single controller's gyro: pick axes,
+        // watch the cursor. The second Joy-Con places itself against whatever
+        // you pick, so there is no second set of axes to work out.
+        (fusedSection as? NSStackView)?.addArrangedSubview(hintLabel(
+            "Set this up as if it were one gyro — the second Joy-Con works out its own axes by itself. Turn the grip every way once (left/right, up/down, tilt) and it joins in; save that and it is ready immediately every session after. Until it is placed, the right Joy-Con drives alone.",
+            lines: 5
+        ))
+        combineFusionStatusLabel.isSelectable = false
+        combineFusionStatusLabel.maximumNumberOfLines = 2
+        combineFusionStatusLabel.preferredMaxLayoutWidth = 400
+        combineFusionStatusLabel.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        combineFusionStatusLabel.textColor = .secondaryLabelColor
+        (fusedSection as? NSStackView)?.addArrangedSubview(combineFusionStatusLabel)
+
+        // Saving it turns a calibration that has to be re-established by waving
+        // the grip about into one that is simply there at the next launch.
+        saveCalibrationButton.target = self
+        saveCalibrationButton.action = #selector(saveFusionCalibration)
+        clearCalibrationButton.target = self
+        clearCalibrationButton.action = #selector(clearFusionCalibration)
+        (fusedSection as? NSStackView)?.addArrangedSubview(row([saveCalibrationButton, clearCalibrationButton]))
+        updateFusionState(status: .inactive, learned: FusionAlignment())
+
         mainStack.addArrangedSubview(buildGyroSection(gyro: combineLeftGyroControls, activationButtonNames: leftJoyConButtons, title: "Left Gyro"))
         mainStack.addArrangedSubview(buildGyroSection(gyro: combineRightGyroControls, activationButtonNames: rightJoyConButtons, title: "Right Gyro"))
 
         return mainStack
+    }
+
+    /// A wrapping explanatory label. `NSTextField(labelWithString:)` — what
+    /// `labeled()` builds — is single-line: raising maximumNumberOfLines on it
+    /// isn't enough on its own, the text just gets clipped at the first line.
+    /// These need the wrapping variant plus a width to wrap against.
+    private func hintLabel(_ text: String, lines: Int = 2, color: NSColor = .secondaryLabelColor, width: CGFloat = 400) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.isEditable = false
+        label.isSelectable = false
+        label.drawsBackground = false
+        label.textColor = color
+        label.maximumNumberOfLines = lines
+        label.preferredMaxLayoutWidth = width
+        label.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return label
+    }
+
+    /// A radio plus its own explanation. Radio auto-grouping only covers
+    /// buttons that share a superview, which these don't once each one is
+    /// paired with a hint — so exclusivity is enforced in the action instead.
+    private func gyroSourceOption(_ source: CombineGyroSource, title: String, hint: String) -> NSView {
+        let radio = NSButton(radioButtonWithTitle: title, target: self, action: #selector(gyroSourceChanged(_:)))
+        combineSourceRadios[source] = radio
+
+        let hintText = hintLabel(hint, lines: 4, width: 382)
+        if source == .fused { combineFusedRadioHint = hintText }
+
+        let indent = NSView()
+        indent.widthAnchor.constraint(equalToConstant: 18).isActive = true
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.addArrangedSubview(radio)
+        stack.addArrangedSubview(row([indent, hintText]))
+        return stack
     }
 
     private func buildButtonsSection(names: [String], rows: inout [ButtonRow]) -> NSView {
@@ -311,12 +449,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         return stack
     }
 
-    private func buildStickSection(stick: StickControls) -> NSView {
+    private func buildStickSection(stick: StickControls, title: String = "Stick") -> NSView {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
-        stack.addArrangedSubview(sectionTitle("Stick"))
+        stack.addArrangedSubview(sectionTitle(title))
 
         stick.modePopup.addItems(withTitles: ["None", "Mouse", "Key", "Wheel"])
         stick.modePopup.target = self
@@ -342,6 +480,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         stack.alignment = .leading
         stack.spacing = 6
         stack.addArrangedSubview(sectionTitle(title))
+        gyro.sectionView = stack
 
         gyro.enabledCheckbox.target = self
         gyro.enabledCheckbox.action = #selector(settingsChanged(_:))
@@ -365,10 +504,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         gyro.verticalAxisPopup.action = #selector(settingsChanged(_:))
         stack.addArrangedSubview(row([labeled("Horizontal Axis", width: 90), gyro.horizontalAxisPopup]))
         stack.addArrangedSubview(row([labeled("Vertical Axis", width: 90), gyro.verticalAxisPopup]))
-        let hint = labeled("Physical axis identity varies by grip — try combinations here and watch the cursor to find the right one.")
-        hint.maximumNumberOfLines = 2
-        hint.preferredMaxLayoutWidth = 380
-        stack.addArrangedSubview(hint)
+        stack.addArrangedSubview(hintLabel("Physical axis identity varies by grip — try combinations here and watch the cursor to find the right one.", width: 380))
 
         gyro.invertHorizontalCheckbox.target = self
         gyro.invertHorizontalCheckbox.action = #selector(settingsChanged(_:))
@@ -397,17 +533,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     // MARK: - Config -> UI
 
     private func loadFromConfig() {
+        isReloading = true
         loadButtons(config.buttons, into: buttonRows)
-        loadButtons(config.combine.buttons, into: combineButtonRows)
-
         loadStick(config.leftStick, into: leftStickControls)
         loadStick(config.rightStick, into: rightStickControls)
         loadGyro(config.leftGyro, into: leftGyroControls)
         loadGyro(config.rightGyro, into: rightGyroControls)
 
-        combineModePopup.selectItem(at: config.combine.mode == .gripMounted ? 1 : 0)
-        loadGyro(config.combine.leftGyro, into: combineLeftGyroControls)
-        loadGyro(config.combine.rightGyro, into: combineRightGyroControls)
+        combineMode = config.combine.mode
+        combineModeSegmented.selectedSegment = combineMode == .gripMounted ? 1 : 0
+        isReloading = false
+
+        loadCombineProfile(config.combine[combineMode])
+    }
+
+    /// Fills the Combine page from one profile. Everything on that page is
+    /// per-profile, so this replaces the whole page's contents, not just the
+    /// gyro parts.
+    private func loadCombineProfile(_ profile: CombineProfile) {
+        isReloading = true
+        loadButtons(profile.buttons, into: combineButtonRows)
+        loadStick(profile.leftStick, into: combineLeftStickControls)
+        loadStick(profile.rightStick, into: combineRightStickControls)
+        for (source, radio) in combineSourceRadios {
+            radio.state = source == profile.gyroSource ? .on : .off
+        }
+        loadGyro(profile.leftGyro, into: combineLeftGyroControls)
+        loadGyro(profile.rightGyro, into: combineRightGyroControls)
+        loadGyro(profile.fused, into: combineFusedGyroControls)
+        combineSavedAlignment = profile.fusionAlignment
+        isReloading = false
+
+        applyCombineLayout()
     }
 
     private func loadButtons(_ buttons: [String: ButtonAction], into rows: [ButtonRow]) {
@@ -465,24 +622,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// parse are simply omitted (and highlighted) rather than blocking with
     /// an alert, since this fires on every keystroke.
     private func commit() {
-        let buttons = readButtons(from: buttonRows)
-        let combineButtons = readButtons(from: combineButtonRows)
+        guard !isReloading else { return }
 
         var newConfig = AppConfig()
-        newConfig.buttons = buttons
+        newConfig.buttons = readButtons(from: buttonRows)
         newConfig.leftStick = readStick(leftStickControls)
         newConfig.rightStick = readStick(rightStickControls)
         newConfig.leftGyro = readGyro(leftGyroControls)
         newConfig.rightGyro = readGyro(rightGyroControls)
-        newConfig.combine = CombineConfig(
-            mode: combineModePopup.indexOfSelectedItem == 1 ? .gripMounted : .separate,
-            buttons: combineButtons,
-            leftGyro: readGyro(combineLeftGyroControls),
-            rightGyro: readGyro(combineRightGyroControls)
-        )
+
+        // Start from the stored combine settings so the profile that isn't on
+        // screen survives — only the visible one is read back from controls.
+        var combine = config.combine
+        combine.mode = combineMode
+        combine[combineMode] = readCombineProfile()
+        newConfig.combine = combine
 
         config = newConfig
         onSave(newConfig)
+    }
+
+    private func readCombineProfile() -> CombineProfile {
+        var source = combineSourceRadios.first { $0.value.state == .on }?.key ?? .right
+        // The fused radio is disabled outside the grip profile, but a stale
+        // selection must not survive into one where fusing is meaningless.
+        if combineMode == .separate && source == .fused { source = .right }
+
+        return CombineProfile(
+            buttons: readButtons(from: combineButtonRows),
+            leftStick: readStick(combineLeftStickControls),
+            rightStick: readStick(combineRightStickControls),
+            gyroSource: source,
+            leftGyro: readGyro(combineLeftGyroControls),
+            rightGyro: readGyro(combineRightGyroControls),
+            fused: readGyro(combineFusedGyroControls),
+            fusionAlignment: combineSavedAlignment
+        )
     }
 
     private func readButtons(from rows: [ButtonRow]) -> [String: ButtonAction] {
@@ -680,9 +855,187 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     @objc private func copyCombineFromStandalone() {
+        isReloading = true
         loadButtons(readButtons(from: buttonRows), into: combineButtonRows)
+        loadStick(readStick(leftStickControls), into: combineLeftStickControls)
+        loadStick(readStick(rightStickControls), into: combineRightStickControls)
         loadGyro(readGyro(leftGyroControls), into: combineLeftGyroControls)
         loadGyro(readGyro(rightGyroControls), into: combineRightGyroControls)
+        // The fused gyro describes the driving IMU, which is the right one, so
+        // the Right Joy-Con tab is its exact counterpart.
+        loadGyro(readGyro(rightGyroControls), into: combineFusedGyroControls)
+        isReloading = false
         commit()
+    }
+
+    @objc private func copyCombineFromOtherMode() {
+        var profile = config.combine[otherCombineMode]
+        // Copying a grip profile into the held-separately one must not smuggle
+        // in a source that only makes sense for a single rigid body.
+        if combineMode == .separate && profile.gyroSource == .fused {
+            profile.gyroSource = .right
+        }
+        loadCombineProfile(profile)
+        commit()
+    }
+
+    @objc private func combineModeChanged(_ sender: NSSegmentedControl) {
+        let newMode: CombineMode = sender.selectedSegment == 1 ? .gripMounted : .separate
+        guard newMode != combineMode else { return }
+
+        // Flush what's on screen into the profile it still belongs to *before*
+        // switching, or the outgoing profile ends up holding the incoming
+        // one's values — every edit made before the switch silently lost.
+        commit()
+        combineMode = newMode
+        loadCombineProfile(config.combine[newMode])
+        commit()
+    }
+
+    @objc private func gyroSourceChanged(_ sender: NSButton) {
+        for radio in combineSourceRadios.values {
+            radio.state = radio === sender ? .on : .off
+        }
+        applyCombineLayout()
+        commit()
+    }
+
+    // MARK: - Combine page layout
+
+    private var otherCombineMode: CombineMode {
+        combineMode == .gripMounted ? .separate : .gripMounted
+    }
+
+    private var selectedGyroSource: CombineGyroSource {
+        combineSourceRadios.first { $0.value.state == .on }?.key ?? .right
+    }
+
+    /// Reflects the current mode and gyro source in the page: which sections
+    /// apply, and which are only there for context.
+    ///
+    /// Inapplicable *sections* are dimmed rather than removed, so the page
+    /// doesn't change height under the pointer and leave the impression that
+    /// settings were thrown away. The one thing genuinely hidden is Fused
+    /// Output, which has no meaning at all unless fusing is selected.
+    private func applyCombineLayout() {
+        let isGrip = combineMode == .gripMounted
+        combineSourceRadios[.fused]?.isEnabled = isGrip
+        combineFusedRadioHint?.textColor = isGrip ? .secondaryLabelColor : .tertiaryLabelColor
+        copyFromOtherModeButton.title = otherCombineMode == .gripMounted
+            ? "Copy from Mounted in Grip"
+            : "Copy from Held Separately"
+
+        let isFused = selectedGyroSource == .fused
+        combineFusedGyroControls.sectionView?.isHidden = !isFused
+
+        for (side, controls) in [(CombineGyroSource.left, combineLeftGyroControls), (.right, combineRightGyroControls)] {
+            // Fusing presents one gyro, so the per-side sections have nothing
+            // left to say and go away entirely. With a single side selected the
+            // other one stays put but dimmed — see the note on this method.
+            controls.sectionView?.isHidden = isFused
+            setSectionEnabled(controls, selectedGyroSource == side)
+        }
+    }
+
+    /// Reflects what the fusion is actually doing. Whether the second Joy-Con
+    /// has been placed is the one thing about fusing that can't be read off the
+    /// cursor, so it gets said in words.
+    func updateFusionState(status: FusionStatus, learned: FusionAlignment) {
+        latestLearnedAlignment = learned
+
+        switch status {
+        case .inactive:
+            // Worth seeing even with nothing connected: it says whether this
+            // profile is ready to fuse the moment the pair shows up.
+            if let saved = combineSavedAlignment, !saved.isEmpty {
+                combineFusionStatusLabel.stringValue = "Saved calibration: \(saved.description(horizontalAxis: fusedAxisIndex(.horizontal), verticalAxis: fusedAxisIndex(.vertical)))"
+            } else {
+                combineFusionStatusLabel.stringValue = "No saved calibration — the second Joy-Con will place itself once you turn the grip every way."
+            }
+            combineFusionStatusLabel.textColor = .secondaryLabelColor
+        case .learning:
+            combineFusionStatusLabel.stringValue = "◌ Waiting for motion to place the second Joy-Con — turn the grip left/right, up/down, and tilt it. Right Joy-Con only for now."
+            combineFusionStatusLabel.textColor = .secondaryLabelColor
+        case .partial(let placed):
+            combineFusionStatusLabel.stringValue = "◑ \(placed) of 3 axes placed — keep turning the grip: left/right, up/down, and tilt it side to side."
+            combineFusionStatusLabel.textColor = .secondaryLabelColor
+        case .aligned(let saved):
+            combineFusionStatusLabel.stringValue = saved
+                ? "● Fusing on the saved calibration — no warm-up needed."
+                : "● Placed and fusing. Save it and the next session won't have to work it out again."
+            combineFusionStatusLabel.textColor = .systemGreen
+        case .suspended:
+            combineFusionStatusLabel.stringValue = "⚠ The two Joy-Cons disagree about how they're moving — is one out of the grip? Running on the right Joy-Con alone."
+            combineFusionStatusLabel.textColor = .systemOrange
+        }
+
+        // Nothing to save until something has been worked out, and nothing to
+        // save if it's already what's stored.
+        saveCalibrationButton.isEnabled = !latestLearnedAlignment.isEmpty
+            && latestLearnedAlignment != combineSavedAlignment
+        clearCalibrationButton.isEnabled = combineSavedAlignment.map { !$0.isEmpty } ?? false
+    }
+
+    private enum FusedAxis { case horizontal, vertical }
+
+    private func fusedAxisIndex(_ axis: FusedAxis) -> Int {
+        let popup = axis == .horizontal
+            ? combineFusedGyroControls.horizontalAxisPopup
+            : combineFusedGyroControls.verticalAxisPopup
+        let index = popup.indexOfSelectedItem
+        return (index >= 0 && index < 3) ? index : (axis == .horizontal ? 0 : 1)
+    }
+
+    @objc private func saveFusionCalibration() {
+        guard !latestLearnedAlignment.isEmpty else { return }
+        combineSavedAlignment = latestLearnedAlignment
+        commit()
+        updateFusionState(status: .aligned(saved: true), learned: latestLearnedAlignment)
+    }
+
+    @objc private func clearFusionCalibration() {
+        combineSavedAlignment = nil
+        commit()
+        updateFusionState(status: .inactive, learned: latestLearnedAlignment)
+    }
+
+    private func setSectionEnabled(_ controls: GyroControls, _ enabled: Bool) {
+        guard let section = controls.sectionView else { return }
+        section.alphaValue = enabled ? 1.0 : 0.45
+        setControlsEnabled(in: section, enabled)
+    }
+
+    private func setControlsEnabled(in view: NSView, _ enabled: Bool) {
+        for subview in view.subviews {
+            // Labels are NSControls too; the section's alpha already dims
+            // those, and disabling them on top of it reads as broken.
+            let isLabel = (subview as? NSTextField).map { !$0.isEditable } ?? false
+            if let control = subview as? NSControl, !isLabel {
+                control.isEnabled = enabled
+            }
+            setControlsEnabled(in: subview, enabled)
+        }
+    }
+
+    // MARK: - Connection state
+
+    /// Told by `AppController` which halves are actually plugged in, so the
+    /// page can say whether it is the one describing them — the alternative is
+    /// a page whose settings quietly apply to nothing.
+    func updateConnectionState(leftConnected: Bool, rightConnected: Bool) {
+        switch (leftConnected, rightConnected) {
+        case (true, true):
+            combineStatusLabel.stringValue = "● Both Joy-Cons connected — these settings are the ones running."
+            combineStatusLabel.textColor = .systemGreen
+        case (true, false):
+            combineStatusLabel.stringValue = "○ Only the Left Joy-Con is connected — the Left Joy-Con tab is the one running."
+            combineStatusLabel.textColor = .secondaryLabelColor
+        case (false, true):
+            combineStatusLabel.stringValue = "○ Only the Right Joy-Con is connected — the Right Joy-Con tab is the one running."
+            combineStatusLabel.textColor = .secondaryLabelColor
+        case (false, false):
+            combineStatusLabel.stringValue = "○ No Joy-Con connected."
+            combineStatusLabel.textColor = .secondaryLabelColor
+        }
     }
 }

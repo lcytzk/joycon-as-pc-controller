@@ -109,51 +109,131 @@ struct GyroConfig: Codable {
     }
 }
 
-// Whether both Joy-Cons are held one per hand (independent rigid bodies —
-// today's per-side gyro behavior applies unchanged) or clipped into a single
-// grip (one rigid body, two redundant IMUs). Only gyro handling depends on
-// this; buttons and sticks already work the same either way.
-enum CombineMode: String, Codable {
+// Whether both Joy-Cons are held one per hand or clipped into a single grip.
+// This is a *profile selector*, not a behavior flag: each mode carries its own
+// complete set of combine settings — buttons included — because the same
+// physical button can reasonably mean different things depending on how the
+// pair is being held. Nothing here is auto-detectable (there is no signal that
+// says "clipped into a grip"), so the user picks it.
+enum CombineMode: String, Codable, CaseIterable {
     case separate, gripMounted
 }
 
-// Settings that apply only when both Joy-Cons are connected at once. These
-// leftGyro/rightGyro are a *separate* pair from AppConfig's own leftGyro/
-// rightGyro — three fully independent contexts total (standalone left,
-// standalone right, combine), since combined operation is meant to feel
-// different from either controller used alone. NOTE: this is config/UI
-// scaffolding only — runtime fusion of the two IMUs for `.gripMounted` (or
-// any cooperative use of both for `.separate`) is not implemented yet, so
-// `mode` currently has no effect on mouse behavior.
-struct CombineConfig: Codable {
-    var mode: CombineMode = .separate
-    // Independent from the top-level `buttons` — using both Joy-Cons together
-    // can reasonably want a different mapping than either used alone (e.g. a
-    // button that means something as a modifier solo but conflicts when both
-    // are live), even though day to day the two will mostly agree. "Copy
-    // Settings" in the UI seeds this from the standalone buttons as a start.
+// Which gyro drives the cursor while both Joy-Cons are connected. Some choice
+// is mandatory: each ControllerMapper posts an *absolute* cursor position
+// computed from its own captured origin, so two simultaneously-live gyros mean
+// two targets alternating every frame rather than one averaged motion.
+//
+// `.fused` samples both IMUs and combines them into a single trajectory. That
+// only means anything when the two are one rigid body, so it is offered in the
+// `.gripMounted` profile only.
+enum CombineGyroSource: String, Codable {
+    case left, right, fused
+}
+
+/// One complete set of settings for using both Joy-Cons together — everything
+/// that can differ between the two ways of holding them. `CombineMode` selects
+/// which profile is live; the other keeps its own values untouched.
+struct CombineProfile: Codable {
+    // Independent from AppConfig's top-level `buttons`: both-at-once can want
+    // different bindings than either controller alone, and the two holding
+    // modes can want different bindings from each other.
     var buttons: [String: ButtonAction] = [:]
+    // Same reasoning as `buttons`: a stick that is WASD when the halves are one
+    // per hand can want to be the mouse once they're in a grip. Joy-Con L
+    // reports as the left stick and Joy-Con R as the right, so the pair covers
+    // both halves with no overlap.
+    var leftStick: StickConfig = StickConfig()
+    var rightStick: StickConfig = StickConfig()
+    var gyroSource: CombineGyroSource = .right
     var leftGyro: GyroConfig = GyroConfig()
     var rightGyro: GyroConfig = GyroConfig()
+    // The single gyro the user sees while fusing: a complete config, describing
+    // the driving IMU exactly as a one-controller setup would. Where the second
+    // IMU's axes sit relative to these is learned at runtime by `GyroAlignment`
+    // rather than configured, so fusing asks nothing extra of the user.
+    // leftGyro/rightGyro apply to the single-side sources only.
+    var fused: GyroConfig = GyroConfig()
+    // A saved answer to "how is the second IMU oriented relative to the first".
+    // It's a property of two controllers in a grip, so it doesn't change
+    // between sessions — storing it means the pair is ready to fuse the moment
+    // it connects, instead of having to be waved about first. nil = not
+    // calibrated, in which case it is worked out live.
+    var fusionAlignment: FusionAlignment? = nil
 
     init(
-        mode: CombineMode = .separate,
         buttons: [String: ButtonAction] = [:],
+        leftStick: StickConfig = StickConfig(),
+        rightStick: StickConfig = StickConfig(),
+        gyroSource: CombineGyroSource = .right,
         leftGyro: GyroConfig = GyroConfig(),
-        rightGyro: GyroConfig = GyroConfig()
+        rightGyro: GyroConfig = GyroConfig(),
+        fused: GyroConfig = GyroConfig(),
+        fusionAlignment: FusionAlignment? = nil
     ) {
-        self.mode = mode
         self.buttons = buttons
+        self.leftStick = leftStick
+        self.rightStick = rightStick
+        self.gyroSource = gyroSource
         self.leftGyro = leftGyro
         self.rightGyro = rightGyro
+        self.fused = fused
+        self.fusionAlignment = fusionAlignment
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        buttons = try container.decodeIfPresent([String: ButtonAction].self, forKey: .buttons) ?? [:]
+        leftStick = try container.decodeIfPresent(StickConfig.self, forKey: .leftStick) ?? StickConfig()
+        rightStick = try container.decodeIfPresent(StickConfig.self, forKey: .rightStick) ?? StickConfig()
+        gyroSource = try container.decodeIfPresent(CombineGyroSource.self, forKey: .gyroSource) ?? .right
+        leftGyro = try container.decodeIfPresent(GyroConfig.self, forKey: .leftGyro) ?? GyroConfig()
+        rightGyro = try container.decodeIfPresent(GyroConfig.self, forKey: .rightGyro) ?? GyroConfig()
+        fused = try container.decodeIfPresent(GyroConfig.self, forKey: .fused) ?? GyroConfig()
+        fusionAlignment = try container.decodeIfPresent(FusionAlignment.self, forKey: .fusionAlignment)
+    }
+}
+
+// Settings that apply only when both Joy-Cons are connected at once — one
+// profile per holding mode, plus which of them is selected. While both halves
+// are present these take over from the per-side settings entirely: see
+// `CombineCoordinator` and `ControllerMapper.resolveMapping`.
+struct CombineConfig: Codable {
+    var mode: CombineMode = .separate
+    var separate: CombineProfile = CombineProfile()
+    var grip: CombineProfile = CombineProfile()
+
+    /// The profile a given mode selects — lets callers switch profiles without
+    /// restating which stored property that is at every call site.
+    subscript(mode: CombineMode) -> CombineProfile {
+        get { mode == .gripMounted ? grip : separate }
+        set {
+            if mode == .gripMounted { grip = newValue } else { separate = newValue }
+        }
+    }
+
+    var activeProfile: CombineProfile { self[mode] }
+
+    init(mode: CombineMode = .separate, separate: CombineProfile = CombineProfile(), grip: CombineProfile = CombineProfile()) {
+        self.mode = mode
+        self.separate = separate
+        self.grip = grip
+        normalize()
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         mode = try container.decodeIfPresent(CombineMode.self, forKey: .mode) ?? .separate
-        buttons = try container.decodeIfPresent([String: ButtonAction].self, forKey: .buttons) ?? [:]
-        leftGyro = try container.decodeIfPresent(GyroConfig.self, forKey: .leftGyro) ?? GyroConfig()
-        rightGyro = try container.decodeIfPresent(GyroConfig.self, forKey: .rightGyro) ?? GyroConfig()
+        separate = try container.decodeIfPresent(CombineProfile.self, forKey: .separate) ?? CombineProfile()
+        grip = try container.decodeIfPresent(CombineProfile.self, forKey: .grip) ?? CombineProfile()
+        normalize()
+    }
+
+    /// Fusing two independent rigid bodies would produce a motion nobody
+    /// performed, so `.fused` is not a legal choice for the held-separately
+    /// profile no matter where the value came from.
+    private mutating func normalize() {
+        if separate.gyroSource == .fused { separate.gyroSource = .right }
     }
 }
 
@@ -289,15 +369,15 @@ enum KeyValueConfigCodec {
         var lines: [String] = []
 
         encodeButtons(config.buttons, prefix: "button", into: &lines)
-        encodeButtons(config.combine.buttons, prefix: "combine.button", into: &lines)
 
         encodeStick(config.leftStick, prefix: "stick.left", into: &lines)
         encodeStick(config.rightStick, prefix: "stick.right", into: &lines)
         encodeGyro(config.leftGyro, prefix: "gyro.left", into: &lines)
         encodeGyro(config.rightGyro, prefix: "gyro.right", into: &lines)
+
         lines.append("combine.mode=\(config.combine.mode.rawValue)")
-        encodeGyro(config.combine.leftGyro, prefix: "combine.gyro.left", into: &lines)
-        encodeGyro(config.combine.rightGyro, prefix: "combine.gyro.right", into: &lines)
+        encodeCombineProfile(config.combine.separate, prefix: "combine.separate", into: &lines)
+        encodeCombineProfile(config.combine.grip, prefix: "combine.grip", into: &lines)
 
         return lines.sorted().joined(separator: "\n") + "\n"
     }
@@ -318,13 +398,58 @@ enum KeyValueConfigCodec {
         config.rightStick = decodeStick(prefix: "stick.right", from: values)
         config.leftGyro = decodeGyro(prefix: "gyro.left", from: values)
         config.rightGyro = decodeGyro(prefix: "gyro.right", from: values)
-        config.combine = CombineConfig(
-            mode: values["combine.mode"].flatMap(CombineMode.init(rawValue:)) ?? .separate,
-            buttons: decodeButtons(prefix: "combine.button", from: values),
-            leftGyro: decodeGyro(prefix: "combine.gyro.left", from: values),
-            rightGyro: decodeGyro(prefix: "combine.gyro.right", from: values)
-        )
+        config.combine = decodeCombine(from: values)
         return config
+    }
+
+    private static func encodeCombineProfile(_ profile: CombineProfile, prefix: String, into lines: inout [String]) {
+        encodeButtons(profile.buttons, prefix: "\(prefix).button", into: &lines)
+        encodeStick(profile.leftStick, prefix: "\(prefix).stick.left", into: &lines)
+        encodeStick(profile.rightStick, prefix: "\(prefix).stick.right", into: &lines)
+        lines.append("\(prefix).gyroSource=\(profile.gyroSource.rawValue)")
+        encodeGyro(profile.leftGyro, prefix: "\(prefix).gyro.left", into: &lines)
+        encodeGyro(profile.rightGyro, prefix: "\(prefix).gyro.right", into: &lines)
+        encodeGyro(profile.fused, prefix: "\(prefix).gyro.fused", into: &lines)
+        if let alignment = profile.fusionAlignment, !alignment.isEmpty {
+            lines.append("\(prefix).fusion=\(alignment.textForm)")
+        }
+    }
+
+    private static func decodeCombineProfile(prefix: String, from values: [String: String]) -> CombineProfile {
+        CombineProfile(
+            buttons: decodeButtons(prefix: "\(prefix).button", from: values),
+            leftStick: decodeStick(prefix: "\(prefix).stick.left", from: values),
+            rightStick: decodeStick(prefix: "\(prefix).stick.right", from: values),
+            gyroSource: values["\(prefix).gyroSource"].flatMap(CombineGyroSource.init(rawValue:)) ?? .right,
+            leftGyro: decodeGyro(prefix: "\(prefix).gyro.left", from: values),
+            rightGyro: decodeGyro(prefix: "\(prefix).gyro.right", from: values),
+            fused: decodeGyro(prefix: "\(prefix).gyro.fused", from: values),
+            fusionAlignment: values["\(prefix).fusion"].flatMap(FusionAlignment.init(textForm:))
+        )
+    }
+
+    /// Files written before combine settings were split per holding mode carry
+    /// a single unprefixed `combine.*` block. It describes whichever mode was
+    /// selected at the time, so it migrates into that profile and leaves the
+    /// other one at its defaults — rather than being dropped, which would
+    /// silently discard a mapping the user had already tuned.
+    private static func decodeCombine(from values: [String: String]) -> CombineConfig {
+        let mode = values["combine.mode"].flatMap(CombineMode.init(rawValue:)) ?? .separate
+        let hasProfiles = values.keys.contains { $0.hasPrefix("combine.separate.") || $0.hasPrefix("combine.grip.") }
+        guard hasProfiles else {
+            var combine = CombineConfig(mode: mode)
+            combine[mode] = CombineProfile(
+                buttons: decodeButtons(prefix: "combine.button", from: values),
+                leftGyro: decodeGyro(prefix: "combine.gyro.left", from: values),
+                rightGyro: decodeGyro(prefix: "combine.gyro.right", from: values)
+            )
+            return combine
+        }
+        return CombineConfig(
+            mode: mode,
+            separate: decodeCombineProfile(prefix: "combine.separate", from: values),
+            grip: decodeCombineProfile(prefix: "combine.grip", from: values)
+        )
     }
 
     private static func encodeButtons(_ buttons: [String: ButtonAction], prefix: String, into lines: inout [String]) {

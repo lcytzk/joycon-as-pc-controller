@@ -26,7 +26,11 @@ final class ControllerMapper {
 
     private let configLock = NSLock()
     private var storedConfig: AppConfig
-    private var gyroRuntime: GyroRuntime
+    private let combine: CombineCoordinator
+    /// What this controller currently does — resolved once whenever the config
+    /// or the set of connected controllers changes, rather than re-derived on
+    /// every report.
+    private var mapping: ActiveMapping
 
     var config: AppConfig {
         get {
@@ -37,19 +41,83 @@ final class ControllerMapper {
         set {
             configLock.lock()
             storedConfig = newValue
-            gyroRuntime = GyroRuntime(gyroConfig(in: newValue))
             configLock.unlock()
-            // A button that just got remapped would otherwise never see its
-            // release and stay held down system-wide.
-            KeyboardOutput.shared.releaseAll(ownedBy: ObjectIdentifier(self))
+            refreshMapping()
         }
+    }
+
+    /// Called when the *other* Joy-Con connects or disconnects. Which buttons
+    /// and which gyro settings apply depends on whether the pair is complete,
+    /// so completing or breaking it re-resolves this half too.
+    func combineStateChanged() {
+        refreshMapping()
+    }
+
+    private func refreshMapping() {
+        // Snapshot the shared state before taking our own lock — the two are
+        // never held at once, so there is no ordering to get wrong.
+        let combineState = combine.snapshot()
+        configLock.lock()
+        mapping = Self.resolveMapping(for: controller.type, config: storedConfig, combineState: combineState)
+        configLock.unlock()
+        // A button that just got remapped would otherwise never see its
+        // release and stay held down system-wide.
+        KeyboardOutput.shared.releaseAll(ownedBy: ObjectIdentifier(self))
+        // The learned placement of the other IMU is relative to *these* axis
+        // choices, so choosing again throws it away rather than carrying a
+        // stale answer into a different question.
+        renderQueue.async { self.alignment.reset() }
+    }
+
+    /// Works out which button map and gyro settings are in force, and what part
+    /// this half plays in producing cursor motion. Depends on nothing but the
+    /// controller's side, so it is `static`: the decision can be checked
+    /// without a controller to hand.
+    static func resolveMapping(for type: JoyCon.ControllerType, config: AppConfig, combineState: CombineCoordinator.Snapshot) -> ActiveMapping {
+        let isLeft = type == .JoyConL
+
+        guard combineState.isCombined else {
+            return ActiveMapping(
+                gyro: GyroRuntime(isLeft ? config.leftGyro : config.rightGyro),
+                role: .driver,
+                buttons: config.buttons,
+                leftStick: config.leftStick,
+                rightStick: config.rightStick
+            )
+        }
+
+        let profile = combineState.profile
+        let role = CombineCoordinator.role(for: type, isCombined: true, source: profile.gyroSource)
+        let mine = isLeft ? profile.leftGyro : profile.rightGyro
+
+        let gyro: GyroRuntime
+        switch profile.gyroSource {
+        case .fused:
+            // One gyro as far as the user is concerned: the fused config is the
+            // whole of it, describing the driver's IMU. Where the second IMU's
+            // axes sit relative to that is learned at runtime rather than
+            // configured — see `GyroAlignment`.
+            gyro = GyroRuntime(profile.fused)
+        case .left, .right:
+            gyro = role == .driver ? GyroRuntime(mine) : GyroRuntime(GyroConfig())
+        }
+
+        return ActiveMapping(
+            gyro: gyro,
+            role: role,
+            buttons: profile.buttons,
+            leftStick: profile.leftStick,
+            rightStick: profile.rightStick,
+            savedAlignment: profile.fusionAlignment,
+            isCombined: true,
+            isFused: profile.gyroSource == .fused
+        )
     }
 
     // MARK: - Shared state (written on the IOHID thread, drained on renderQueue)
 
     private let inputLock = NSLock()
-    private var sampleSumH: Double = 0
-    private var sampleSumV: Double = 0
+    private var sampleSum = SIMD3<Double>()
     private var sampleCount = 0
     private var activationHeld = false
     private var needsRecenter = false
@@ -81,6 +149,42 @@ final class ControllerMapper {
     private let stillnessThreshold: Double = 3.0 // deg/s — above any plausible residual offset
     private let biasTimeConstant: Double = 2.0   // seconds
 
+    /// renderQueue-only, like the filters and the orientation they feed.
+    private var fusion: GyroFusion
+    private var alignment = GyroAlignment()
+
+    private let statusLock = NSLock()
+    private var storedFusionStatus: FusionStatus = .inactive
+    private var storedLearnedAlignment = FusionAlignment()
+
+    /// How fusing is getting on, for the settings window to show. Whether the
+    /// second Joy-Con has been placed yet is the one part of this the user
+    /// can't tell by watching the cursor.
+    var fusionStatus: FusionStatus {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return storedFusionStatus
+    }
+
+    private func publishFusionStatus(_ status: FusionStatus) {
+        statusLock.lock()
+        if storedFusionStatus != status { storedFusionStatus = status }
+        statusLock.unlock()
+    }
+
+    /// What has been worked out live, for the settings window to offer to save.
+    var learnedAlignment: FusionAlignment {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return storedLearnedAlignment
+    }
+
+    private func publishLearnedAlignment(_ alignment: FusionAlignment) {
+        statusLock.lock()
+        if storedLearnedAlignment != alignment { storedLearnedAlignment = alignment }
+        statusLock.unlock()
+    }
+
     // Orientation accumulated since the activation button went down. Reset on
     // each press, so integration error never has more than one hold to build up in.
     private var gyroOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -100,18 +204,13 @@ final class ControllerMapper {
     private var pressedButtons: Set<JoyCon.Button> = [] // IOHID thread only
     private var diagnostics: GyroDiagnostics?
 
-    /// Joy-Con L and Joy-Con R each carry their own IMU, mounted at a different
-    /// orientation on the two controllers' PCBs, so the same physical motion
-    /// reads as a different (axis, sign) combination on each side — gyro
-    /// settings are per-side rather than shared.
-    private func gyroConfig(in config: AppConfig) -> GyroConfig {
-        controller.type == .JoyConL ? config.leftGyro : config.rightGyro
-    }
-
-    init(controller: JoyConSwift.Controller, config: AppConfig) {
+    init(controller: JoyConSwift.Controller, config: AppConfig, combine: CombineCoordinator) {
         self.controller = controller
         self.storedConfig = config
-        self.gyroRuntime = GyroRuntime(controller.type == .JoyConL ? config.leftGyro : config.rightGyro)
+        self.combine = combine
+        self.mapping = ActiveMapping(gyro: GyroRuntime(GyroConfig()))
+        self.fusion = GyroFusion(stillnessThreshold: stillnessThreshold)
+        refreshMapping()
 
         var framesPerSecond = 120
         if #available(macOS 12.0, *) {
@@ -148,27 +247,27 @@ final class ControllerMapper {
         }
         controller.leftStickPosHandler = { [weak self] pos in
             guard let self = self else { return }
-            self.handleStickPos(pos, stick: self.config.leftStick)
+            self.handleStickPos(pos, stick: self.mappingSnapshot().leftStick)
         }
         controller.rightStickPosHandler = { [weak self] pos in
             guard let self = self else { return }
-            self.handleStickPos(pos, stick: self.config.rightStick)
+            self.handleStickPos(pos, stick: self.mappingSnapshot().rightStick)
         }
         controller.leftStickHandler = { [weak self] newDir, oldDir in
             guard let self = self else { return }
-            self.handleStickDirection(newDir, oldDir, stick: self.config.leftStick, prefix: "lstick")
+            self.handleStickDirection(newDir, oldDir, stick: self.mappingSnapshot().leftStick, prefix: "lstick")
         }
         controller.rightStickHandler = { [weak self] newDir, oldDir in
             guard let self = self else { return }
-            self.handleStickDirection(newDir, oldDir, stick: self.config.rightStick, prefix: "rstick")
+            self.handleStickDirection(newDir, oldDir, stick: self.mappingSnapshot().rightStick, prefix: "rstick")
         }
         controller.sensorHandler = { [weak self] in self?.handleGyro() }
     }
 
-    private func gyroSnapshot() -> GyroRuntime {
+    private func mappingSnapshot() -> ActiveMapping {
         configLock.lock()
         defer { configLock.unlock() }
-        return gyroRuntime
+        return mapping
     }
 
     private func outputKey(_ source: String) -> OutputKey {
@@ -180,27 +279,38 @@ final class ControllerMapper {
     private func handleButton(_ button: JoyCon.Button, isDown: Bool) {
         if isDown { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
 
-        let runtime = gyroSnapshot()
-        if let activation = runtime.activationButton, activation == button {
-            switch runtime.activationMode {
+        let mapping = mappingSnapshot()
+        if let activation = mapping.gyro.activationButton, activation == button {
+            // While both halves are connected the activation state is shared:
+            // the button that arms the gyro can sit on the controller that
+            // isn't the one driving the cursor.
+            switch mapping.gyro.activationMode {
             case .hold:
-                inputLock.lock()
-                activationHeld = isDown
-                if isDown { needsRecenter = true }
-                inputLock.unlock()
+                if mapping.isCombined {
+                    combine.setActivation(held: isDown)
+                } else {
+                    inputLock.lock()
+                    activationHeld = isDown
+                    if isDown { needsRecenter = true }
+                    inputLock.unlock()
+                }
             case .toggle:
                 // Only the press flips state — a release of the same button
                 // must not immediately toggle it back off.
                 if isDown {
-                    inputLock.lock()
-                    activationHeld.toggle()
-                    if activationHeld { needsRecenter = true }
-                    inputLock.unlock()
+                    if mapping.isCombined {
+                        combine.toggleActivation()
+                    } else {
+                        inputLock.lock()
+                        activationHeld.toggle()
+                        if activationHeld { needsRecenter = true }
+                        inputLock.unlock()
+                    }
                 }
             }
         }
 
-        guard let name = buttonNames[button], let action = config.buttons[name] else { return }
+        guard let name = buttonNames[button], let action = mapping.buttons[name] else { return }
         perform(action, isDown: isDown, source: "button.\(name)")
     }
 
@@ -277,11 +387,11 @@ final class ControllerMapper {
     /// (roll, around the direction the "laser" points) is dropped: spinning a
     /// rigidly-held forward-pointing laser about its own axis can't move where
     /// it lands.
-    private func rawAxisValue(_ axisName: String, gyro: SCNVector3) -> Double {
+    private static func axisIndex(_ axisName: String) -> Int {
         switch axisName {
-        case "y": return Double(gyro.y)
-        case "z": return Double(gyro.z)
-        default: return Double(gyro.x)
+        case "y": return 1
+        case "z": return 2
+        default: return 0
         }
     }
 
@@ -289,16 +399,23 @@ final class ControllerMapper {
     /// three, ~15 ms apart. Summing here and averaging per render tick decimates
     /// the burst properly instead of aliasing it into the cursor.
     private func handleGyro() {
-        let runtime = gyroSnapshot()
-        guard runtime.enabled else { return }
+        let mapping = mappingSnapshot()
+        let runtime = mapping.gyro
+        guard runtime.enabled, mapping.role != .off else { return }
 
         let gyro = controller.gyro
-        let h = rawAxisValue(runtime.horizontalAxis, gyro: gyro)
-        let v = rawAxisValue(runtime.verticalAxis, gyro: gyro)
+        let raw = SIMD3<Double>(Double(gyro.x), Double(gyro.y), Double(gyro.z))
+
+        // A contributor hands over its axes untouched — which of them answers
+        // to horizontal and vertical is the driver's to work out, and its own
+        // pipeline stays idle.
+        if mapping.role == .contributor {
+            combine.deposit(raw)
+            return
+        }
 
         inputLock.lock()
-        sampleSumH += h
-        sampleSumV += v
+        sampleSum += raw
         sampleCount += 1
         inputLock.unlock()
     }
@@ -319,12 +436,12 @@ final class ControllerMapper {
         lastTickTime = now
 
         inputLock.lock()
-        let sumH = sampleSumH, sumV = sampleSumV, count = sampleCount
-        let held = activationHeld
-        let recenter = needsRecenter
+        let sum = sampleSum, count = sampleCount
+        var held = activationHeld
+        var recenter = needsRecenter
         var dx = pendingMouseDx, dy = pendingMouseDy
         let scrollX = pendingScrollX, scrollY = pendingScrollY
-        sampleSumH = 0; sampleSumV = 0; sampleCount = 0
+        sampleSum = SIMD3<Double>(); sampleCount = 0
         needsRecenter = false
         pendingMouseDx = 0; pendingMouseDy = 0
         pendingScrollX = 0; pendingScrollY = 0
@@ -332,16 +449,44 @@ final class ControllerMapper {
 
         diagnostics?.record(sampleCount: count, now: now)
 
-        let runtime = gyroSnapshot()
+        let mapping = mappingSnapshot()
+        let runtime = mapping.gyro
+        // A contributor feeds the other half's fusion and an `.off` half feeds
+        // nothing — neither posts cursor motion of its own, but both still
+        // drive their stick and scroll output below.
+        let drivesGyro = mapping.role == .driver && runtime.enabled
+
+        if mapping.isCombined && drivesGyro {
+            let shared = combine.takeActivation()
+            held = shared.held
+            recenter = shared.recenter
+        }
+
+        // Which axis drives which direction is applied here rather than per
+        // report: picking a component of the mean is the same as averaging that
+        // component, and it keeps the sampling path down to one vector add.
+        let rawMean: SIMD3<Double>? = count > 0 ? sum / Double(count) : nil
+        var rate: (h: Double, v: Double)? = rawMean.map {
+            (h: $0[Self.axisIndex(runtime.horizontalAxis)], v: $0[Self.axisIndex(runtime.verticalAxis)])
+        }
+        var bothSidesStill = true
+        if drivesGyro && mapping.isFused {
+            (rate, bothSidesStill) = fuseWithOtherHalf(
+                own: rate, raw: rawMean, runtime: runtime, saved: mapping.savedAlignment, dt: dt
+            )
+        } else {
+            publishFusionStatus(.inactive)
+        }
+
         // While the activation button is held the controller is being aimed,
         // so nothing observed then is evidence about the sensor's zero.
-        let mayLearnBias = runtime.activationButton == nil || !held
-        updateAngularVelocity(sumH: sumH, sumV: sumV, count: count, dt: dt, now: now, enabled: runtime.enabled, mayLearnBias: mayLearnBias)
+        let mayLearnBias = (runtime.activationButton == nil || !held) && bothSidesStill
+        updateAngularVelocity(rate: rate, dt: dt, now: now, enabled: drivesGyro, mayLearnBias: mayLearnBias)
 
-        if runtime.enabled, runtime.activationButton != nil {
+        if drivesGyro, runtime.activationButton != nil {
             applyLaser(runtime: runtime, held: held, recenter: recenter, dt: dt, stickDx: dx, stickDy: dy)
         } else {
-            if runtime.enabled {
+            if drivesGyro {
                 let (gx, gy) = continuousGyroDelta(runtime: runtime, dt: dt)
                 dx += gx
                 dy += gy
@@ -352,25 +497,86 @@ final class ControllerMapper {
         flushScroll(x: scrollX, y: scrollY)
     }
 
+    /// Places the other half's IMU against this one's chosen axes, then averages
+    /// the two. Both steps degrade to "this IMU alone", which is the whole
+    /// safety story of fusing: the fallback is exactly the behaviour the user
+    /// would have had with a single Joy-Con, never something invented.
+    private func fuseWithOtherHalf(
+        own: (h: Double, v: Double)?,
+        raw: SIMD3<Double>?,
+        runtime: GyroRuntime,
+        saved: FusionAlignment?,
+        dt: Double
+    ) -> (rate: (h: Double, v: Double)?, bothSidesStill: Bool) {
+        let other = combine.drainBus()
+        let horizontal = Self.axisIndex(runtime.horizontalAxis)
+        let vertical = Self.axisIndex(runtime.verticalAxis)
+
+        // A saved calibration covering the axes actually in use is the whole
+        // answer, and nothing needs learning. It covering only some of them —
+        // after the user re-picks which axis aims sideways, say — leaves the
+        // learner to fill in the rest rather than starting over.
+        let saved = saved ?? FusionAlignment()
+        let savedCoversUse = saved.knows(driverAxis: horizontal) && saved.knows(driverAxis: vertical)
+        if !savedCoversUse, let other = other, let raw = raw {
+            alignment.update(driverRaw: raw, other: other, dt: dt)
+        }
+        let inUse = saved.merging(alignment.result)
+
+        let projected: (h: Double, v: Double)?
+        if let other = other {
+            let mappedH = inUse.value(driverAxis: horizontal, from: other)
+            let mappedV = inUse.value(driverAxis: vertical, from: other)
+            if let own = own {
+                // An axis that isn't placed falls back to the driver's own
+                // reading, so it averages to exactly what one Joy-Con would
+                // have produced — one direction can start fusing before the
+                // other without the second one misbehaving.
+                projected = (mappedH ?? own.h, mappedV ?? own.v)
+            } else if let mappedH = mappedH, let mappedV = mappedV {
+                // This half dropped a report and the other didn't. Covering the
+                // gap needs both directions placed: there is nothing of our own
+                // left to fall back to.
+                projected = (mappedH, mappedV)
+            } else {
+                projected = nil
+            }
+        } else {
+            projected = nil
+        }
+
+        let result = fusion.combine(own: own, other: projected, dt: dt)
+        publishFusionStatus(status(inUse: inUse, savedCoversUse: savedCoversUse, horizontal: horizontal, vertical: vertical))
+        publishLearnedAlignment(alignment.result)
+        return result
+    }
+
+    private func status(inUse: FusionAlignment, savedCoversUse: Bool, horizontal: Int, vertical: Int) -> FusionStatus {
+        if fusion.isSuspended { return .suspended }
+        let knowsHorizontal = inUse.knows(driverAxis: horizontal)
+        let knowsVertical = inUse.knows(driverAxis: vertical)
+        if knowsHorizontal && knowsVertical { return .aligned(saved: savedCoversUse) }
+        let placed = alignment.placedAxisCount
+        return placed > 0 ? .partial(placed: placed) : .learning
+    }
+
     /// Turns however many (or few) raw samples arrived into a continuously
     /// defined angular velocity. This is what absorbs the burstiness: rather
     /// than moving the cursor when data happens to show up, the cursor always
     /// moves at the current best estimate of how fast the controller is turning.
-    private func updateAngularVelocity(sumH: Double, sumV: Double, count: Int, dt: Double, now: CFTimeInterval, enabled: Bool, mayLearnBias: Bool) {
+    private func updateAngularVelocity(rate: (h: Double, v: Double)?, dt: Double, now: CFTimeInterval, enabled: Bool, mayLearnBias: Bool) {
         guard enabled else { return }
 
-        if count > 0 {
-            let rawH = sumH / Double(count)
-            let rawV = sumV / Double(count)
+        if let rate = rate {
             lastSampleTime = now
 
-            if mayLearnBias && abs(rawH) < stillnessThreshold && abs(rawV) < stillnessThreshold {
+            if mayLearnBias && abs(rate.h) < stillnessThreshold && abs(rate.v) < stillnessThreshold {
                 let alpha = 1 - exp(-dt / biasTimeConstant)
-                biasH += (rawH - biasH) * alpha
-                biasV += (rawV - biasV) * alpha
+                biasH += (rate.h - biasH) * alpha
+                biasV += (rate.v - biasV) * alpha
             }
-            targetRateH = rawH - biasH
-            targetRateV = rawV - biasV
+            targetRateH = rate.h - biasH
+            targetRateV = rate.v - biasV
         } else if now - lastSampleTime > staleSampleGrace {
             // A delivery gap — Bluetooth stalls of 100 ms+ are routine for a
             // Joy-Con on a Mac. Aim at a standstill and let the filter glide
@@ -555,7 +761,23 @@ final class ControllerMapper {
 
 /// The hot subset of `GyroConfig`, resolved once per config change so the
 /// sample path never walks dictionaries or does string lookups.
-private struct GyroRuntime {
+/// What a controller is currently mapped to: the button bindings in force, the
+/// gyro settings in force, and the part this half plays in producing cursor
+/// motion. Resolved from the config plus whether both halves are connected.
+struct ActiveMapping {
+    var gyro: GyroRuntime
+    var role: GyroRole = .driver
+    var buttons: [String: ButtonAction] = [:]
+    var leftStick: StickConfig = StickConfig()
+    var rightStick: StickConfig = StickConfig()
+    /// A calibration saved in the profile, if there is one. Its presence is
+    /// what spares the user having to wave the grip about at every launch.
+    var savedAlignment: FusionAlignment?
+    var isCombined = false
+    var isFused = false
+}
+
+struct GyroRuntime {
     var enabled = false
     var sensitivity: Double = 8
     var horizontalAxis = "x"
