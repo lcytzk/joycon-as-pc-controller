@@ -37,7 +37,7 @@ final class ControllerMapper {
         set {
             configLock.lock()
             storedConfig = newValue
-            gyroRuntime = GyroRuntime(newValue.gyro)
+            gyroRuntime = GyroRuntime(gyroConfig(in: newValue))
             configLock.unlock()
             // A button that just got remapped would otherwise never see its
             // release and stay held down system-wide.
@@ -100,10 +100,18 @@ final class ControllerMapper {
     private var pressedButtons: Set<JoyCon.Button> = [] // IOHID thread only
     private var diagnostics: GyroDiagnostics?
 
+    /// Joy-Con L and Joy-Con R each carry their own IMU, mounted at a different
+    /// orientation on the two controllers' PCBs, so the same physical motion
+    /// reads as a different (axis, sign) combination on each side — gyro
+    /// settings are per-side rather than shared.
+    private func gyroConfig(in config: AppConfig) -> GyroConfig {
+        controller.type == .JoyConL ? config.leftGyro : config.rightGyro
+    }
+
     init(controller: JoyConSwift.Controller, config: AppConfig) {
         self.controller = controller
         self.storedConfig = config
-        self.gyroRuntime = GyroRuntime(config.gyro)
+        self.gyroRuntime = GyroRuntime(controller.type == .JoyConL ? config.leftGyro : config.rightGyro)
 
         var framesPerSecond = 120
         if #available(macOS 12.0, *) {
@@ -172,11 +180,24 @@ final class ControllerMapper {
     private func handleButton(_ button: JoyCon.Button, isDown: Bool) {
         if isDown { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
 
-        if let activation = gyroSnapshot().activationButton, activation == button {
-            inputLock.lock()
-            activationHeld = isDown
-            if isDown { needsRecenter = true }
-            inputLock.unlock()
+        let runtime = gyroSnapshot()
+        if let activation = runtime.activationButton, activation == button {
+            switch runtime.activationMode {
+            case .hold:
+                inputLock.lock()
+                activationHeld = isDown
+                if isDown { needsRecenter = true }
+                inputLock.unlock()
+            case .toggle:
+                // Only the press flips state — a release of the same button
+                // must not immediately toggle it back off.
+                if isDown {
+                    inputLock.lock()
+                    activationHeld.toggle()
+                    if activationHeld { needsRecenter = true }
+                    inputLock.unlock()
+                }
+            }
         }
 
         guard let name = buttonNames[button], let action = config.buttons[name] else { return }
@@ -542,6 +563,7 @@ private struct GyroRuntime {
     var invertHorizontal = false
     var invertVertical = false
     var activationButton: JoyCon.Button?
+    var activationMode: GyroActivationMode = .hold
     var minCutoff: Double = 2.5
 
     init(_ config: GyroConfig) {
@@ -549,6 +571,7 @@ private struct GyroRuntime {
         sensitivity = config.sensitivity
         horizontalAxis = config.horizontalAxis
         verticalAxis = config.verticalAxis
+        activationMode = config.activationMode
         invertHorizontal = config.invertHorizontal
         invertVertical = config.invertVertical
         if let name = config.activationButton, !name.isEmpty {

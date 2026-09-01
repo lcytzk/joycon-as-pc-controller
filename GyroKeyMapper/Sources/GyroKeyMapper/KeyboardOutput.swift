@@ -175,7 +175,12 @@ final class KeyboardOutput {
 
     private func postKey(_ code: CGKeyCode, down: Bool, autorepeat: Bool = false) {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
-        event.flags = currentFlags()
+        var flags = currentFlags()
+        // Function keys and arrows carry the fn bit on real hardware, and global
+        // hotkey matching compares it (see functionGroupKeyCodes) — without it an
+        // F12 reaches the focused app but never fires an F12 global hotkey.
+        if functionGroupKeyCodes.contains(code) { flags.insert(.maskSecondaryFn) }
+        event.flags = flags
         if autorepeat { event.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
         event.post(tap: .cghidEventTap)
     }

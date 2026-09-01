@@ -50,6 +50,21 @@ let modifierFlagsByKeyCode: [CGKeyCode: CGEventFlags] = [
     0x3F: .maskSecondaryFn,                     // fn
 ]
 
+// Keys macOS puts in the "function-key group". Hardware reports the fn bit
+// (NX_SECONDARYFNMASK / .maskSecondaryFn) alongside these, and the window
+// server's global-hotkey matching compares it: a synthetic F12 posted without
+// the bit does not match a hotkey registered from a real F12 press (iTerm2's
+// hotkey window, Carbon RegisterEventHotKey generally), even though a focused
+// app still sees the key perfectly well — AppKit re-derives the flag from the
+// keycode when it builds the NSEvent, which is why a key-code viewer happily
+// shows "F12" for an event no global hotkey will accept.
+let functionGroupKeyCodes: Set<CGKeyCode> = Set([
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10",
+    "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20",
+    "left", "right", "up", "down",
+    "help", "home", "pageup", "forwarddelete", "end", "pagedown",
+].compactMap { keyCodes[$0] })
+
 // The side-specific bit hardware sets alongside the generic mask
 // (NX_DEVICE*KEYMASK in IOKit's IOLLEvent.h — not exposed as CGEventFlags
 // constants). A listener has no other way to tell left Control from right
