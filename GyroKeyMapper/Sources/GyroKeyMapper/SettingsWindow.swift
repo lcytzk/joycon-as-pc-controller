@@ -16,6 +16,26 @@ private let rightJoyConButtons: [String] = [
 
 private let actionKindTitles = ["None", "Key", "Mouse Left", "Mouse Right", "Mouse Center"]
 
+// Rotate-to-switch-tabs (see `StickRotationConfig`) is offered as two more
+// choices in an FN combination row's target popup, alongside every ordinary
+// controller button — picking one turns that row into "while this FN key is
+// held, sweep this stick to switch tabs/apps" instead of "press this button".
+// The ids are deliberately unlike any button name (`buttonNames`'s values are
+// all bare button names with no punctuation) so they can share the same
+// `representedObject`-keyed candidate list and duplicate-detection logic
+// (`fnRowButtonChanged`) as real buttons without ever colliding with one.
+private let leftStickRotateTargetID = "rotate.left"
+private let rightStickRotateTargetID = "rotate.right"
+private let stickRotationRowTargets: [(id: String, title: String)] = [
+    (leftStickRotateTargetID, "Left Stick Rotate"),
+    (rightStickRotateTargetID, "Right Stick Rotate"),
+]
+private let rotationTargetTitles = ["Off", "Ctrl+Tab (browser tabs)", "Option+Tab", "Cmd+Tab (app switcher)"]
+
+private func isStickRotationTarget(_ id: String) -> Bool {
+    id == leftStickRotateTargetID || id == rightStickRotateTargetID
+}
+
 private func labeled(_ text: String, width: CGFloat? = nil) -> NSTextField {
     let label = NSTextField(labelWithString: text)
     if let width = width {
@@ -52,10 +72,7 @@ private struct StickControls {
     let debugLabel = NSTextField(labelWithString: "live: waiting for input…")
 }
 
-/// One gyro section's controls — see `StickControls`. A class rather than a
-/// struct because `buildGyroSection` records the rows it builds here, so the
-/// Combine page can later hide or dim parts of a section without having to
-/// re-derive them from the view hierarchy.
+/// One gyro section's controls — see `StickControls`.
 private final class GyroControls {
     let enabledCheckbox = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
     let sensitivityField = NSTextField()
@@ -68,9 +85,6 @@ private final class GyroControls {
     // Mutually exclusive with each other: a button either activates the gyro
     // mouse while held, or toggles it on/off with a click.
     let activationModePopup = NSPopUpButton()
-
-    /// The section as a whole, so it can be hidden or dimmed in one go.
-    weak var sectionView: NSStackView?
 }
 
 /// A plain NSButton that remembers which text field it should fill in when
@@ -79,11 +93,20 @@ private final class RecordButton: NSButton {
     weak var targetField: NSTextField?
 }
 
-/// One "FN + button → action" line.
+/// One "FN + target → action" line. `buttonPopup` names the target — an
+/// ordinary controller button, or one of the two stick-rotation pseudo-
+/// targets (see `stickRotationRowTargets`) — and `typePopup` + `keyField`/
+/// `degreesField` hold whichever kind of action that target takes: a button
+/// takes an action kind (None/Key/Mouse) and, for Key, a key name; a
+/// rotation target takes a rotation target (Off/Ctrl/Option/Cmd) and, for
+/// anything but Off, degrees-per-switch. Only one of `keyField`/`degreesField`
+/// is ever visible at a time — see `configureRowKind`.
 private final class FnRow {
     let buttonPopup = NSPopUpButton()
     let typePopup = NSPopUpButton()
     let keyField = NSTextField()
+    let degreesField = NSTextField()
+    var recordButtonRef: NSButton?
     let removeButton = NSButton(title: "Remove", target: nil, action: nil)
     var container: NSView?
 }
@@ -108,12 +131,6 @@ private final class FnControls {
     let layersStack = NSStackView()
     let addLayerButton = NSButton(title: "+ Add FN Key", target: nil, action: nil)
     var layers: [FnLayerControls] = []
-    /// Rotate-to-switch only fires while an FN key is held — see
-    /// `StickRotationConfig`. One popup + degrees field per physical stick.
-    let leftRotationPopup = NSPopUpButton()
-    let leftRotationDegreesField = NSTextField()
-    let rightRotationPopup = NSPopUpButton()
-    let rightRotationDegreesField = NSTextField()
     /// Everything below the enable checkbox, so it can be dimmed as a unit.
     weak var body: NSStackView?
 }
@@ -203,20 +220,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private let rightGyroControls = GyroControls()
     private let leftTestControls = TestPageControls()
     private let rightTestControls = TestPageControls()
-    // Combine has its own independent left/right gyro pair — three fully
-    // separate contexts (standalone left, standalone right, combine), since
-    // combined operation is meant to feel different from either controller
-    // used alone.
-    private let combineLeftGyroControls = GyroControls()
-    private let combineRightGyroControls = GyroControls()
-    // Tuning for the single trajectory fused from both IMUs.
-    private let combineFusedGyroControls = GyroControls()
-    private let combineLeftStickControls = StickControls()
-    private let combineRightStickControls = StickControls()
-    // Combine's own button mapping — independent from `buttonRows` above.
-    // Using both Joy-Cons together can reasonably want different bindings
-    // than either alone, so this isn't just a read-only mirror.
-    private var combineButtonRows: [ButtonRow] = []
 
     // The Combine page shows one holding-mode profile at a time. This is which
     // one — the controls below it are that profile's, and everything read out
@@ -240,7 +243,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var combineSavedAlignment: FusionAlignment?
     /// The latest live-learned alignment, pushed in by `AppController`.
     private var latestLearnedAlignment = FusionAlignment()
-    private let copyFromOtherModeButton = NSButton(title: "Copy from Other Mode", target: nil, action: nil)
 
     /// Set while controls are being filled in from a config, so the autosave
     /// path stays out of the way. Programmatic setters mostly don't fire their
@@ -260,6 +262,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     // unlike NSEvent.ModifierFlags.control which can't tell them apart.
     private var recordingHeldModifierFlags: NSEvent.ModifierFlags = []
     private var recordingCapturedKeyOrder: [CGKeyCode] = []
+
+    // Controller-button conflict detection (FN tab): each FN key/button-
+    // choosing popup's last confirmed selection, so a rejected reassignment
+    // has an exact value to roll back to — an NSPopUpButton has no
+    // "editing session" the way a text field does to hook a revert into.
+    private var confirmedButtonSelections: [ObjectIdentifier: String] = [:]
 
     init(
         config: AppConfig, onSave: @escaping (AppConfig) -> Void,
@@ -414,6 +422,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         body.addArrangedSubview(hintLabel("An FN key keeps its ordinary binding on a tap and switches layer when held — so making a button an FN key costs you nothing. Its tap action is simply its row in the Combine tab's button list; leave that row unset for a key that does nothing on its own.", lines: 4, width: 460))
         body.addArrangedSubview(hintLabel("Buttons you don't list keep doing what they do without FN. Holding two FN keys at once does nothing at all, rather than guessing which one you meant.", lines: 3, width: 460))
+        body.addArrangedSubview(hintLabel("A combination's target is usually a button, but it can also be \"Left/Right Stick Rotate\": while this FN key is held, push that stick all the way out in any direction — that push is itself the first switch — then keep sweeping: clockwise taps Tab, counter-clockwise taps Shift+Tab, once per Degrees/switch of further rotation. The chosen key stays down until the stick is back to center.", lines: 6, width: 460))
 
         fnControls.layersStack.orientation = .vertical
         fnControls.layersStack.alignment = .leading
@@ -423,35 +432,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnControls.addLayerButton.target = self
         fnControls.addLayerButton.action = #selector(addFnLayer(_:))
         body.addArrangedSubview(fnControls.addLayerButton)
-
-        let rotationStack = NSStackView()
-        rotationStack.orientation = .vertical
-        rotationStack.alignment = .leading
-        rotationStack.spacing = 6
-        rotationStack.addArrangedSubview(sectionTitle("Rotate Stick While FN Held"))
-        rotationStack.addArrangedSubview(hintLabel("While any FN key is held, push the stick all the way out in any direction — that push is itself the first switch. From there, keep sweeping: clockwise taps Tab, counter-clockwise taps Shift+Tab, once per Degrees/switch of further rotation. The chosen key stays down until the stick is back to center. Off outside an FN hold, so ordinary play (aiming, menus) can't misfire it.", lines: 5, width: 460))
-
-        fnControls.leftRotationPopup.addItems(withTitles: ["Off", "Ctrl+Tab (browser tabs)", "Option+Tab", "Cmd+Tab (app switcher)"])
-        fnControls.leftRotationPopup.target = self
-        fnControls.leftRotationPopup.action = #selector(settingsChanged(_:))
-        fnControls.leftRotationDegreesField.delegate = self
-        fnControls.leftRotationDegreesField.widthAnchor.constraint(equalToConstant: 50).isActive = true
-        rotationStack.addArrangedSubview(row([
-            labeled("Left Stick", width: 80), fnControls.leftRotationPopup,
-            labeled("Degrees/switch"), fnControls.leftRotationDegreesField,
-        ]))
-
-        fnControls.rightRotationPopup.addItems(withTitles: ["Off", "Ctrl+Tab (browser tabs)", "Option+Tab", "Cmd+Tab (app switcher)"])
-        fnControls.rightRotationPopup.target = self
-        fnControls.rightRotationPopup.action = #selector(settingsChanged(_:))
-        fnControls.rightRotationDegreesField.delegate = self
-        fnControls.rightRotationDegreesField.widthAnchor.constraint(equalToConstant: 50).isActive = true
-        rotationStack.addArrangedSubview(row([
-            labeled("Right Stick", width: 80), fnControls.rightRotationPopup,
-            labeled("Degrees/switch"), fnControls.rightRotationDegreesField,
-        ]))
-
-        body.addArrangedSubview(rotationStack)
 
         // Live feedback, because everything else on this page is a guess until
         // you can see whether a hold actually registered.
@@ -547,6 +527,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         layer.keyPopup.action = #selector(fnKeyChanged(_:))
         let selected = key ?? ""
         layer.keyPopup.selectItem(at: layer.keyPopup.itemArray.firstIndex { ($0.representedObject as? String) == selected } ?? 0)
+        confirmedButtonSelections[ObjectIdentifier(layer.keyPopup)] = selected
 
         layer.removeButton.target = self
         layer.removeButton.action = #selector(removeFnLayer(_:))
@@ -571,26 +552,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnControls.layers.append(layer)
     }
 
-    private func addFnRow(to layer: FnLayerControls, name: String?, action: ButtonAction?) {
+    /// `name` is either a button name or one of `stickRotationRowTargets`'
+    /// ids; `action` supplies the initial value for a button row, `rotation`
+    /// for a stick-rotation row — whichever doesn't apply is nil.
+    private func addFnRow(to layer: FnLayerControls, name: String?, action: ButtonAction? = nil, rotation: StickRotationConfig? = nil) {
         let fnRow = FnRow()
 
         var candidates = availableFnButtons()
         // A saved binding stays selectable even if it is now spoken for
         // elsewhere, so the row shows the truth rather than silently changing.
-        if let name = name, !candidates.contains(name) { candidates.append(name) }
+        if let name = name, !candidates.contains(name), !isStickRotationTarget(name) { candidates.append(name) }
         for candidate in candidates {
             fnRow.buttonPopup.addItem(withTitle: candidate)
             fnRow.buttonPopup.lastItem?.representedObject = candidate
         }
+        for target in stickRotationRowTargets {
+            fnRow.buttonPopup.addItem(withTitle: target.title)
+            fnRow.buttonPopup.lastItem?.representedObject = target.id
+        }
         fnRow.buttonPopup.target = self
-        fnRow.buttonPopup.action = #selector(settingsChanged(_:))
+        fnRow.buttonPopup.action = #selector(fnRowButtonChanged(_:))
         let wanted = name ?? nextFnButton(for: layer) ?? candidates.first
         if let wanted = wanted,
            let index = fnRow.buttonPopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == wanted }) {
             fnRow.buttonPopup.selectItem(at: index)
         }
+        confirmedButtonSelections[ObjectIdentifier(fnRow.buttonPopup)] = wanted ?? ""
 
-        fnRow.typePopup.addItems(withTitles: actionKindTitles)
         fnRow.typePopup.target = self
         fnRow.typePopup.action = #selector(buttonTypeChanged(_:))
 
@@ -598,11 +586,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnRow.keyField.delegate = self
         fnRow.keyField.widthAnchor.constraint(equalToConstant: 130).isActive = true
 
+        fnRow.degreesField.placeholderString = "deg/switch"
+        fnRow.degreesField.delegate = self
+        fnRow.degreesField.widthAnchor.constraint(equalToConstant: 60).isActive = true
+
+        fnRow.recordButtonRef = recordButton(for: fnRow.keyField)
+
         fnRow.removeButton.target = self
         fnRow.removeButton.action = #selector(removeFnCombination(_:))
 
-        // Same encoding as the plain button rows, so "Mouse Left" and a recorded
-        // combo behave identically here.
+        let isRotation = isStickRotationTarget(wanted ?? "")
+        configureRowKind(fnRow, isRotation: isRotation)
+        if isRotation {
+            loadStickRotation(rotation ?? StickRotationConfig(), into: fnRow.typePopup, field: fnRow.degreesField)
+            fnRow.degreesField.isEnabled = (rotation ?? StickRotationConfig()).target != .off
+        } else {
+            loadFnRowAction(action, into: fnRow)
+        }
+
+        let container = row([
+            labeled("FN +", width: 40), fnRow.buttonPopup,
+            fnRow.typePopup, fnRow.keyField, fnRow.recordButtonRef!, fnRow.degreesField, fnRow.removeButton,
+        ])
+        fnRow.container = container
+        layer.rowsStack.addArrangedSubview(container)
+        layer.rows.append(fnRow)
+    }
+
+    /// Swaps `typePopup`'s meaning between an action kind (button target) and
+    /// a rotation target (stick-rotation target), and shows only the field
+    /// that kind actually uses. Called whenever a row's target crosses that
+    /// boundary — within one kind the existing selection stays valid as-is.
+    private func configureRowKind(_ fnRow: FnRow, isRotation: Bool) {
+        fnRow.typePopup.removeAllItems()
+        fnRow.typePopup.addItems(withTitles: isRotation ? rotationTargetTitles : actionKindTitles)
+        fnRow.keyField.isHidden = isRotation
+        fnRow.recordButtonRef?.isHidden = isRotation
+        fnRow.degreesField.isHidden = !isRotation
+    }
+
+    /// Same encoding as the plain button rows, so "Mouse Left" and a recorded
+    /// combo behave identically here.
+    private func loadFnRowAction(_ action: ButtonAction?, into fnRow: FnRow) {
         if let mouse = action?.mouseButton {
             switch mouse.lowercased() {
             case "right": fnRow.typePopup.selectItem(at: 3)
@@ -618,14 +643,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             fnRow.typePopup.selectItem(at: 0)
             fnRow.keyField.isEnabled = false
         }
+    }
 
-        let container = row([
-            labeled("FN +", width: 40), fnRow.buttonPopup,
-            fnRow.typePopup, fnRow.keyField, recordButton(for: fnRow.keyField), fnRow.removeButton,
-        ])
-        fnRow.container = container
-        layer.rowsStack.addArrangedSubview(container)
-        layer.rows.append(fnRow)
+    /// Resets a row to its kind's "nothing" state — "None" and an empty key
+    /// for a button row, "Off" and no degrees for a rotation row. Used when a
+    /// duplicate target claim is resolved in favor of a different row.
+    private func resetFnRowToNone(_ fnRow: FnRow) {
+        fnRow.typePopup.selectItem(at: 0)
+        fnRow.keyField.stringValue = ""
+        fnRow.keyField.isEnabled = false
+        fnRow.degreesField.stringValue = ""
+        fnRow.degreesField.isEnabled = false
     }
 
     private func clearFnLayers() {
@@ -677,19 +705,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         combineModeSegmented.action = #selector(combineModeChanged(_:))
         combineModeSegmented.selectedSegment = 0
         modeStack.addArrangedSubview(combineModeSegmented)
-        modeStack.addArrangedSubview(hintLabel("Each mode keeps its own buttons, sticks and gyro settings. Switching only changes which set this page shows and edits — the other one keeps everything it had.", lines: 3))
+        modeStack.addArrangedSubview(hintLabel("Each mode keeps its own choice of which gyro drives the cursor. Everything else — buttons, sticks, and each gyro's own tuning — comes from the Left/Right Joy-Con tabs and doesn't change here.", lines: 4))
         mainStack.addArrangedSubview(modeStack)
-
-        let copyStack = NSStackView()
-        copyStack.orientation = .vertical
-        copyStack.alignment = .leading
-        copyStack.spacing = 4
-        let copyButton = NSButton(title: "Copy from Left/Right Tabs", target: self, action: #selector(copyCombineFromStandalone))
-        copyFromOtherModeButton.target = self
-        copyFromOtherModeButton.action = #selector(copyCombineFromOtherMode)
-        copyStack.addArrangedSubview(row([copyButton, copyFromOtherModeButton]))
-        copyStack.addArrangedSubview(hintLabel("Seeds the profile currently shown — buttons, sticks and gyro — as a starting point to fine-tune.", lines: 3))
-        mainStack.addArrangedSubview(copyStack)
 
         let sourceStack = NSStackView()
         sourceStack.orientation = .vertical
@@ -698,59 +715,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         sourceStack.addArrangedSubview(sectionTitle("Gyro Source"))
         sourceStack.addArrangedSubview(gyroSourceOption(
             .left, title: "Left Joy-Con only",
-            hint: "The right Joy-Con's gyro stays off; its buttons and stick work as normal."
+            hint: "Tuned from the Left Joy-Con tab. The right Joy-Con's gyro stays off; its buttons and stick work as normal."
         ))
         sourceStack.addArrangedSubview(gyroSourceOption(
             .right, title: "Right Joy-Con only",
-            hint: "The left Joy-Con's gyro stays off; its buttons and stick work as normal."
+            hint: "Tuned from the Right Joy-Con tab. The left Joy-Con's gyro stays off; its buttons and stick work as normal."
         ))
         let fusedOption = gyroSourceOption(
             .fused, title: "Both, fused — needs the grip",
-            hint: "One gyro, fed by both IMUs: they cover each other's dropped reports and agree on when the pair is still, so aim holds steadier. Configured as a single gyro below — the second Joy-Con places itself. Only valid when the two are one rigid body; don't pick this holding them one per hand."
+            hint: "One gyro, fed by both IMUs: they cover each other's dropped reports and agree on when the pair is still, so aim holds steadier. Tuned from the Right Joy-Con tab — the second Joy-Con places itself against whatever axes that picks, so there's nothing extra to configure. Only valid when the two are one rigid body; don't pick this holding them one per hand."
         )
         sourceStack.addArrangedSubview(fusedOption)
         mainStack.addArrangedSubview(sourceStack)
 
-        mainStack.addArrangedSubview(buildButtonsSection(names: leftJoyConButtons + rightJoyConButtons, rows: &combineButtonRows))
-        // Both halves' sticks, for the same reason the buttons are here: a
-        // stick can want a different job in a grip than it does held alone.
-        // Unaffected by Gyro Source — that only arbitrates the gyros.
-        mainStack.addArrangedSubview(buildStickSection(stick: combineLeftStickControls, title: "Left Stick"))
-        mainStack.addArrangedSubview(buildStickSection(stick: combineRightStickControls, title: "Right Stick"))
-
-        // Either half's button can arm the fused gyro — in a grip they are one
-        // device as far as the hands are concerned.
-        let fusedSection = buildGyroSection(
-            gyro: combineFusedGyroControls,
-            activationButtonNames: leftJoyConButtons + rightJoyConButtons,
-            title: "Fused Gyro"
-        )
-        mainStack.addArrangedSubview(fusedSection)
-        // Tune this exactly as you would a single controller's gyro: pick axes,
-        // watch the cursor. The second Joy-Con places itself against whatever
-        // you pick, so there is no second set of axes to work out.
-        (fusedSection as? NSStackView)?.addArrangedSubview(hintLabel(
-            "Set this up as if it were one gyro — the second Joy-Con works out its own axes by itself. Turn the grip every way once (left/right, up/down, tilt) and it joins in; save that and it is ready immediately every session after. Until it is placed, the right Joy-Con drives alone.",
-            lines: 5
+        let fusionStack = NSStackView()
+        fusionStack.orientation = .vertical
+        fusionStack.alignment = .leading
+        fusionStack.spacing = 6
+        fusionStack.addArrangedSubview(sectionTitle("Fusion Calibration"))
+        fusionStack.addArrangedSubview(hintLabel(
+            "How the second Joy-Con's IMU sits relative to the first, learned by turning the grip every way once (left/right, up/down, tilt). Saving it means fusing is ready immediately every session after, instead of having to be worked out again by waving the grip about.",
+            lines: 4
         ))
         combineFusionStatusLabel.isSelectable = false
         combineFusionStatusLabel.maximumNumberOfLines = 2
         combineFusionStatusLabel.preferredMaxLayoutWidth = 400
         combineFusionStatusLabel.widthAnchor.constraint(equalToConstant: 400).isActive = true
         combineFusionStatusLabel.textColor = .secondaryLabelColor
-        (fusedSection as? NSStackView)?.addArrangedSubview(combineFusionStatusLabel)
+        fusionStack.addArrangedSubview(combineFusionStatusLabel)
 
-        // Saving it turns a calibration that has to be re-established by waving
-        // the grip about into one that is simply there at the next launch.
         saveCalibrationButton.target = self
         saveCalibrationButton.action = #selector(saveFusionCalibration)
         clearCalibrationButton.target = self
         clearCalibrationButton.action = #selector(clearFusionCalibration)
-        (fusedSection as? NSStackView)?.addArrangedSubview(row([saveCalibrationButton, clearCalibrationButton]))
+        fusionStack.addArrangedSubview(row([saveCalibrationButton, clearCalibrationButton]))
+        mainStack.addArrangedSubview(fusionStack)
         updateFusionState(status: .inactive, learned: FusionAlignment())
-
-        mainStack.addArrangedSubview(buildGyroSection(gyro: combineLeftGyroControls, activationButtonNames: leftJoyConButtons, title: "Left Gyro"))
-        mainStack.addArrangedSubview(buildGyroSection(gyro: combineRightGyroControls, activationButtonNames: rightJoyConButtons, title: "Right Gyro"))
 
         return mainStack
     }
@@ -857,7 +857,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         stack.alignment = .leading
         stack.spacing = 6
         stack.addArrangedSubview(sectionTitle(title))
-        gyro.sectionView = stack
 
         gyro.enabledCheckbox.target = self
         gyro.enabledCheckbox.action = #selector(settingsChanged(_:))
@@ -912,8 +911,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private func loadFromConfig() {
         isReloading = true
         loadFn(config.combine.fn)
-        loadStickRotation(config.combine.leftStickRotation, into: fnControls.leftRotationPopup, field: fnControls.leftRotationDegreesField)
-        loadStickRotation(config.combine.rightStickRotation, into: fnControls.rightRotationPopup, field: fnControls.rightRotationDegreesField)
         loadButtons(config.buttons, into: buttonRows)
         loadStick(config.leftStick, into: leftStickControls)
         loadStick(config.rightStick, into: rightStickControls)
@@ -927,20 +924,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         loadCombineProfile(config.combine[combineMode])
     }
 
-    /// Fills the Combine page from one profile. Everything on that page is
-    /// per-profile, so this replaces the whole page's contents, not just the
-    /// gyro parts.
+    /// Fills the Combine page from one profile: which gyro drives the cursor,
+    /// plus the calibration fusing has learned or been given.
     private func loadCombineProfile(_ profile: CombineProfile) {
         isReloading = true
-        loadButtons(profile.buttons, into: combineButtonRows)
-        loadStick(profile.leftStick, into: combineLeftStickControls)
-        loadStick(profile.rightStick, into: combineRightStickControls)
         for (source, radio) in combineSourceRadios {
             radio.state = source == profile.gyroSource ? .on : .off
         }
-        loadGyro(profile.leftGyro, into: combineLeftGyroControls)
-        loadGyro(profile.rightGyro, into: combineRightGyroControls)
-        loadGyro(profile.fused, into: combineFusedGyroControls)
         combineSavedAlignment = profile.fusionAlignment
         isReloading = false
 
@@ -984,6 +974,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
                 guard let action = layer.bindings[name], name != (layer.key ?? "") else { continue }
                 addFnRow(to: fnControls.layers[index], name: name, action: action)
             }
+            // A rotation row only appears if it's actually configured — same
+            // reasoning as a button binding: a stick left at .off keeps doing
+            // whatever it already does, rather than cluttering every layer
+            // with two rows nobody set.
+            if layer.leftStickRotation.target != .off {
+                addFnRow(to: fnControls.layers[index], name: leftStickRotateTargetID, rotation: layer.leftStickRotation)
+            }
+            if layer.rightStickRotation.target != .off {
+                addFnRow(to: fnControls.layers[index], name: rightStickRotateTargetID, rotation: layer.rightStickRotation)
+            }
         }
         applyFnEnabled()
     }
@@ -993,12 +993,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnControls.body?.alphaValue = enabled ? 1.0 : 0.45
         setControlsEnabled(in: fnControls.body ?? NSStackView(), enabled)
 
-        // `setControlsEnabled` is a blanket pass, so it re-enables key fields
-        // that only apply to a "Key" row. Left alone, a Mouse or None row would
-        // offer an editable field whose contents `readFn` then throws away.
+        // `setControlsEnabled` is a blanket pass, so it re-enables fields that
+        // only apply to some other selection of the same row — a Mouse/None
+        // button row's key field, or an Off rotation row's degrees field —
+        // which `readFn` then ignores anyway, but shouldn't look editable.
         for layer in fnControls.layers {
             for fnRow in layer.rows {
-                fnRow.keyField.isEnabled = enabled && fnRow.typePopup.indexOfSelectedItem == 1
+                let target = fnRow.buttonPopup.selectedItem?.representedObject as? String ?? ""
+                if isStickRotationTarget(target) {
+                    fnRow.degreesField.isEnabled = enabled && fnRow.typePopup.indexOfSelectedItem != 0
+                } else {
+                    fnRow.keyField.isEnabled = enabled && fnRow.typePopup.indexOfSelectedItem == 1
+                }
             }
         }
     }
@@ -1015,25 +1021,41 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             if !unique.isEmpty { claimed.insert(unique) }
 
             var bindings: [String: ButtonAction] = [:]
+            var leftRotation = StickRotationConfig()
+            var rightRotation = StickRotationConfig()
+
             for fnRow in layerControls.rows {
-                guard let name = fnRow.buttonPopup.selectedItem?.representedObject as? String else { continue }
+                guard let target = fnRow.buttonPopup.selectedItem?.representedObject as? String else { continue }
+
+                if target == leftStickRotateTargetID {
+                    leftRotation = readStickRotation(popup: fnRow.typePopup, field: fnRow.degreesField)
+                    continue
+                }
+                if target == rightStickRotateTargetID {
+                    rightRotation = readStickRotation(popup: fnRow.typePopup, field: fnRow.degreesField)
+                    continue
+                }
+
                 // FN + itself is nothing.
-                guard name != unique else { continue }
+                guard target != unique else { continue }
                 switch fnRow.typePopup.indexOfSelectedItem {
                 case 1:
                     let combo = fnRow.keyField.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
                     highlightIfUnknown(fnRow.keyField, text: combo)
                     if !combo.isEmpty && isFullyKnown(combo) {
-                        bindings[name] = ButtonAction(key: combo, mouseButton: nil)
+                        bindings[target] = ButtonAction(key: combo, mouseButton: nil)
                     }
-                case 2: bindings[name] = ButtonAction(key: nil, mouseButton: "left")
-                case 3: bindings[name] = ButtonAction(key: nil, mouseButton: "right")
-                case 4: bindings[name] = ButtonAction(key: nil, mouseButton: "center")
+                case 2: bindings[target] = ButtonAction(key: nil, mouseButton: "left")
+                case 3: bindings[target] = ButtonAction(key: nil, mouseButton: "right")
+                case 4: bindings[target] = ButtonAction(key: nil, mouseButton: "center")
                 default: fnRow.keyField.textColor = .labelColor
                 }
             }
 
-            layers.append(FnLayer(key: unique.isEmpty ? nil : unique, bindings: bindings))
+            layers.append(FnLayer(
+                key: unique.isEmpty ? nil : unique, bindings: bindings,
+                leftStickRotation: leftRotation, rightStickRotation: rightRotation
+            ))
         }
 
         return FnConfig(enabled: fnControls.enabledCheckbox.state == .on, layers: layers)
@@ -1111,8 +1133,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         var combine = config.combine
         combine.mode = combineMode
         combine.fn = readFn()
-        combine.leftStickRotation = readStickRotation(popup: fnControls.leftRotationPopup, field: fnControls.leftRotationDegreesField)
-        combine.rightStickRotation = readStickRotation(popup: fnControls.rightRotationPopup, field: fnControls.rightRotationDegreesField)
         combine[combineMode] = readCombineProfile()
         newConfig.combine = combine
 
@@ -1126,16 +1146,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         // selection must not survive into one where fusing is meaningless.
         if combineMode == .separate && source == .fused { source = .right }
 
-        return CombineProfile(
-            buttons: readButtons(from: combineButtonRows),
-            leftStick: readStick(combineLeftStickControls),
-            rightStick: readStick(combineRightStickControls),
-            gyroSource: source,
-            leftGyro: readGyro(combineLeftGyroControls),
-            rightGyro: readGyro(combineRightGyroControls),
-            fused: readGyro(combineFusedGyroControls),
-            fusionAlignment: combineSavedAlignment
-        )
+        return CombineProfile(gyroSource: source, fusionAlignment: combineSavedAlignment)
     }
 
     private func readButtons(from rows: [ButtonRow]) -> [String: ButtonAction] {
@@ -1341,14 +1352,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     // MARK: - Actions
 
     @objc private func buttonTypeChanged(_ sender: NSPopUpButton) {
-        if let r = (buttonRows + combineButtonRows).first(where: { $0.typePopup === sender }) {
+        if let r = buttonRows.first(where: { $0.typePopup === sender }) {
             r.keyField.isEnabled = sender.indexOfSelectedItem == 1
             commit()
             return
         }
         let fnRows = fnControls.layers.flatMap { $0.rows }
         guard let fnRow = fnRows.first(where: { $0.typePopup === sender }) else { return }
-        fnRow.keyField.isEnabled = sender.indexOfSelectedItem == 1
+        let target = fnRow.buttonPopup.selectedItem?.representedObject as? String ?? ""
+        if isStickRotationTarget(target) {
+            fnRow.degreesField.isEnabled = sender.indexOfSelectedItem != 0
+        } else {
+            fnRow.keyField.isEnabled = sender.indexOfSelectedItem == 1
+        }
         commit()
     }
 
@@ -1360,12 +1376,90 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// Moving an FN key changes which buttons are still free to bind under it,
     /// so the lists are rebuilt from the saved result rather than left showing
     /// choices that would be dropped on the next save.
+    ///
+    /// Two layers keyed to the same physical button is meaningless — holding
+    /// it can't mean two different layers at once — and `readFn()` already
+    /// has to pick one silently if this is somehow reached anyway (the later
+    /// layer keeps its combinations but loses the key). Checking here first
+    /// means that never happens without the user having said yes to it.
     @objc private func fnKeyChanged(_ sender: NSPopUpButton) {
+        guard let layer = fnControls.layers.first(where: { $0.keyPopup === sender }) else { return }
+        let newValue = sender.selectedItem?.representedObject as? String ?? ""
+
+        if !newValue.isEmpty,
+           let conflict = fnControls.layers.first(where: { $0 !== layer && ($0.keyPopup.selectedItem?.representedObject as? String) == newValue }) {
+            guard confirmButtonCollision(buttonName: newValue, existingUse: "another FN key") else {
+                selectButton(confirmedButtonSelections[ObjectIdentifier(sender)] ?? "", in: sender)
+                return
+            }
+            selectButton("", in: conflict.keyPopup)
+            confirmedButtonSelections[ObjectIdentifier(conflict.keyPopup)] = ""
+        }
+
+        confirmedButtonSelections[ObjectIdentifier(sender)] = newValue
         commit()
         let fn = readFn()
         isReloading = true
         loadFn(fn)
         isReloading = false
+    }
+
+    /// A row's target popup offers every button not already claimed as an FN
+    /// *key* (see `availableFnButtons`), plus the two stick-rotation targets,
+    /// but nothing stops picking one a sibling row in the same layer already
+    /// targets — `readFn()` would then silently keep whichever row it
+    /// iterates last (see `nextFnButton`'s note on exactly this). Checked
+    /// here instead of left to collapse quietly.
+    @objc private func fnRowButtonChanged(_ sender: NSPopUpButton) {
+        guard let layer = fnControls.layers.first(where: { $0.rows.contains { $0.buttonPopup === sender } }),
+              let fnRow = layer.rows.first(where: { $0.buttonPopup === sender }) else { return }
+        let newValue = sender.selectedItem?.representedObject as? String ?? ""
+        let previousValue = confirmedButtonSelections[ObjectIdentifier(sender)] ?? ""
+
+        if !newValue.isEmpty,
+           let conflict = layer.rows.first(where: { $0 !== fnRow && ($0.buttonPopup.selectedItem?.representedObject as? String) == newValue }) {
+            guard confirmButtonCollision(buttonName: fnRowTargetDisplayName(newValue), existingUse: "another combination under this FN key") else {
+                selectButton(previousValue, in: sender)
+                return
+            }
+            resetFnRowToNone(conflict)
+        }
+
+        // Crossing between a real button and a stick-rotation target changes
+        // what the row's type popup even means (action kind vs. rotation
+        // target), so it's rebuilt from scratch rather than kept as whatever
+        // it showed for the old kind.
+        if isStickRotationTarget(newValue) != isStickRotationTarget(previousValue) {
+            configureRowKind(fnRow, isRotation: isStickRotationTarget(newValue))
+        }
+
+        confirmedButtonSelections[ObjectIdentifier(sender)] = newValue
+        commit()
+    }
+
+    private func fnRowTargetDisplayName(_ id: String) -> String {
+        stickRotationRowTargets.first { $0.id == id }?.title ?? id
+    }
+
+    /// The same physical controller button (or stick-rotation target)
+    /// claimed twice is ambiguous — a single press or sweep can't mean two
+    /// different things — so this asks before letting the second claim
+    /// quietly win. This is about the controller's own input identity only;
+    /// different bindings sharing the same *keyboard* output key is
+    /// unrelated and perfectly fine.
+    private func confirmButtonCollision(buttonName: String, existingUse: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "\"\(buttonName)\" is already used"
+        alert.informativeText = "Already assigned to \(existingUse). Continuing clears that assignment so only this one uses \"\(buttonName)\"."
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func selectButton(_ name: String, in popup: NSPopUpButton) {
+        guard let index = popup.itemArray.firstIndex(where: { ($0.representedObject as? String) == name }) else { return }
+        popup.selectItem(at: index)
     }
 
     @objc private func addFnLayer(_ sender: NSButton) {
@@ -1401,31 +1495,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         commit()
     }
 
-    @objc private func copyCombineFromStandalone() {
-        isReloading = true
-        loadButtons(readButtons(from: buttonRows), into: combineButtonRows)
-        loadStick(readStick(leftStickControls), into: combineLeftStickControls)
-        loadStick(readStick(rightStickControls), into: combineRightStickControls)
-        loadGyro(readGyro(leftGyroControls), into: combineLeftGyroControls)
-        loadGyro(readGyro(rightGyroControls), into: combineRightGyroControls)
-        // The fused gyro describes the driving IMU, which is the right one, so
-        // the Right Joy-Con tab is its exact counterpart.
-        loadGyro(readGyro(rightGyroControls), into: combineFusedGyroControls)
-        isReloading = false
-        commit()
-    }
-
-    @objc private func copyCombineFromOtherMode() {
-        var profile = config.combine[otherCombineMode]
-        // Copying a grip profile into the held-separately one must not smuggle
-        // in a source that only makes sense for a single rigid body.
-        if combineMode == .separate && profile.gyroSource == .fused {
-            profile.gyroSource = .right
-        }
-        loadCombineProfile(profile)
-        commit()
-    }
-
     @objc private func combineModeChanged(_ sender: NSSegmentedControl) {
         let newMode: CombineMode = sender.selectedSegment == 1 ? .gripMounted : .separate
         guard newMode != combineMode else { return }
@@ -1449,39 +1518,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     // MARK: - Combine page layout
 
-    private var otherCombineMode: CombineMode {
-        combineMode == .gripMounted ? .separate : .gripMounted
-    }
-
-    private var selectedGyroSource: CombineGyroSource {
-        combineSourceRadios.first { $0.value.state == .on }?.key ?? .right
-    }
-
-    /// Reflects the current mode and gyro source in the page: which sections
-    /// apply, and which are only there for context.
-    ///
-    /// Inapplicable *sections* are dimmed rather than removed, so the page
-    /// doesn't change height under the pointer and leave the impression that
-    /// settings were thrown away. The one thing genuinely hidden is Fused
-    /// Output, which has no meaning at all unless fusing is selected.
+    /// Fusing only makes sense clipped into a grip — one rigid body, two
+    /// IMUs — so the radio is disabled (dimmed, not hidden, so the page
+    /// doesn't change shape under the pointer) outside that holding mode.
     private func applyCombineLayout() {
         let isGrip = combineMode == .gripMounted
         combineSourceRadios[.fused]?.isEnabled = isGrip
         combineFusedRadioHint?.textColor = isGrip ? .secondaryLabelColor : .tertiaryLabelColor
-        copyFromOtherModeButton.title = otherCombineMode == .gripMounted
-            ? "Copy from Mounted in Grip"
-            : "Copy from Held Separately"
-
-        let isFused = selectedGyroSource == .fused
-        combineFusedGyroControls.sectionView?.isHidden = !isFused
-
-        for (side, controls) in [(CombineGyroSource.left, combineLeftGyroControls), (.right, combineRightGyroControls)] {
-            // Fusing presents one gyro, so the per-side sections have nothing
-            // left to say and go away entirely. With a single side selected the
-            // other one stays put but dimmed — see the note on this method.
-            controls.sectionView?.isHidden = isFused
-            setSectionEnabled(controls, selectedGyroSource == side)
-        }
     }
 
     /// Reflects what the fusion is actually doing. Whether the second Joy-Con
@@ -1528,11 +1571,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// can be answered by watching a number instead of guessing from behaviour.
     /// `nil` means that physical stick's controller isn't connected right now.
     func updateStickDebugState(left: StickDebugState?, right: StickDebugState?) {
-        applyStickDebug(left, to: leftStickControls, combineControls: combineLeftStickControls)
-        applyStickDebug(right, to: rightStickControls, combineControls: combineRightStickControls)
+        applyStickDebug(left, to: leftStickControls)
+        applyStickDebug(right, to: rightStickControls)
     }
 
-    private func applyStickDebug(_ state: StickDebugState?, to controls: StickControls, combineControls: StickControls) {
+    private func applyStickDebug(_ state: StickDebugState?, to controls: StickControls) {
         let text: String
         let color: NSColor
         if let state = state {
@@ -1544,10 +1587,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             text = "live: not connected"
             color = .secondaryLabelColor
         }
-        for label in [controls.debugLabel, combineControls.debugLabel] {
-            label.stringValue = text
-            label.textColor = color
-        }
+        controls.debugLabel.stringValue = text
+        controls.debugLabel.textColor = color
     }
 
     /// One side's diagnostic page: which buttons are down, the stick's live
@@ -1600,9 +1641,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private enum FusedAxis { case horizontal, vertical }
 
     private func fusedAxisIndex(_ axis: FusedAxis) -> Int {
-        let popup = axis == .horizontal
-            ? combineFusedGyroControls.horizontalAxisPopup
-            : combineFusedGyroControls.verticalAxisPopup
+        // Fusing tunes as the right half's own gyro (see `CombineProfile`), so
+        // its axis choice is what a saved calibration is described against.
+        let popup = axis == .horizontal ? rightGyroControls.horizontalAxisPopup : rightGyroControls.verticalAxisPopup
         let index = popup.indexOfSelectedItem
         return (index >= 0 && index < 3) ? index : (axis == .horizontal ? 0 : 1)
     }
@@ -1618,12 +1659,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         combineSavedAlignment = nil
         commit()
         updateFusionState(status: .inactive, learned: latestLearnedAlignment)
-    }
-
-    private func setSectionEnabled(_ controls: GyroControls, _ enabled: Bool) {
-        guard let section = controls.sectionView else { return }
-        section.alphaValue = enabled ? 1.0 : 0.45
-        setControlsEnabled(in: section, enabled)
     }
 
     private func setControlsEnabled(in view: NSView, _ enabled: Bool) {

@@ -104,10 +104,7 @@ final class AppController: NSObject {
     }
 
     private func refreshCombineState(adding extra: JoyConSwift.Controller? = nil) {
-        combine.update(
-            isCombined: isCombined(including: extra), profile: config.combine.activeProfile, fn: config.combine.fn,
-            leftStickRotation: config.combine.leftStickRotation, rightStickRotation: config.combine.rightStickRotation
-        )
+        combine.update(isCombined: isCombined(including: extra), profile: config.combine.activeProfile, fn: config.combine.fn)
     }
 
     private func notifyCombineStateChanged() {

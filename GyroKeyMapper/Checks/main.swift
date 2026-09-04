@@ -181,22 +181,16 @@ func fullyPopulated() -> AppConfig {
     config.rightGyro = GyroConfig(enabled: true, sensitivity: 22, horizontalAxis: "y")
     config.combine.mode = .gripMounted
     config.combine.fn = FnConfig(enabled: true, layers: [
-        FnLayer(key: "ZR", bindings: ["Left": ButtonAction(key: "backspace")]),
+        FnLayer(
+            key: "ZR", bindings: ["Left": ButtonAction(key: "backspace")],
+            leftStickRotation: StickRotationConfig(target: .ctrl, degreesPerStep: 60),
+            rightStickRotation: StickRotationConfig(target: .command, degreesPerStep: 45)
+        ),
         FnLayer(key: "ZL", bindings: ["A": ButtonAction(mouseButton: "right")]),
     ])
-    config.combine.separate = CombineProfile(
-        buttons: ["B": ButtonAction(key: "esc")],
-        leftStick: StickConfig(mode: .wheel, speed: 3),
-        rightStick: StickConfig(mode: .key, speed: 9, keys: ["down": ButtonAction(key: "s")]),
-        gyroSource: .left,
-        leftGyro: GyroConfig(enabled: true, sensitivity: 11),
-        rightGyro: GyroConfig(verticalAxis: "z"),
-        fused: GyroConfig(enabled: true, sensitivity: 99, activationButton: "R")
-    )
+    config.combine.separate = CombineProfile(gyroSource: .left)
     config.combine.grip = CombineProfile(
-        buttons: ["X": ButtonAction(key: "f12")],
         gyroSource: .fused,
-        fused: GyroConfig(enabled: true, sensitivity: 14, horizontalAxis: "z", invertHorizontal: true),
         fusionAlignment: FusionAlignment(textForm: "+y,+z,-x")
     )
     return config
@@ -227,9 +221,12 @@ do {
     check(once == twice, "saving twice produces an identical file")
 }
 
-// Combine settings used to live in one unprefixed block. Such a file belongs to
-// whichever holding mode was selected when it was written; dropping it would
-// throw away a mapping the user had already tuned.
+// Combine settings used to live in one unprefixed block, including its own
+// combine.button.*/combine.gyro.* — from when combine kept a second copy of
+// buttons and per-side gyro tuning. Neither exists on CombineProfile any
+// more, so such a file's combine.mode/combine.fn still load, and the button/
+// gyro keys are simply unrecognized, same as any other setting an older or
+// newer build doesn't know about.
 do {
     let migrated = KeyValueConfigCodec.decode("""
     button.B.key=x
@@ -237,9 +234,7 @@ do {
     combine.button.A.key=enter
     combine.gyro.left.sensitivity=40.0
     """)
-    checkEqual(migrated.combine.grip.buttons["A"]?.key, "enter", "a pre-profile file migrates into the selected mode")
-    checkEqual(migrated.combine.grip.leftGyro.sensitivity, 40.0, "including its gyro settings")
-    check(migrated.combine.separate.buttons.isEmpty, "the mode that wasn't selected stays empty")
+    checkEqual(migrated.combine.mode, .gripMounted, "combine.mode still loads from such a file")
     checkEqual(migrated.buttons["B"]?.key, "x", "settings outside combine are untouched")
 }
 

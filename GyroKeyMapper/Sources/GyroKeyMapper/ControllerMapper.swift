@@ -129,29 +129,37 @@ final class ControllerMapper {
 
         let profile = combineState.profile
         let role = CombineCoordinator.role(for: type, isCombined: true, source: profile.gyroSource)
-        let mine = isLeft ? profile.leftGyro : profile.rightGyro
 
+        // Fusing tunes as a single gyro, and that single gyro is always the
+        // right half's own settings: `role(for:)` always makes the right half
+        // the fused driver, so there's no separate "fused" tuning to keep in
+        // sync with it — see `CombineProfile`. Where the second IMU's axes
+        // sit relative to those is learned at runtime rather than configured
+        // — see `GyroAlignment`.
         let gyro: GyroRuntime
-        switch profile.gyroSource {
-        case .fused:
-            // One gyro as far as the user is concerned: the fused config is the
-            // whole of it, describing the driver's IMU. Where the second IMU's
-            // axes sit relative to that is learned at runtime rather than
-            // configured — see `GyroAlignment`.
-            gyro = GyroRuntime(profile.fused)
-        case .left, .right:
-            gyro = role == .driver ? GyroRuntime(mine) : GyroRuntime(GyroConfig())
+        switch role {
+        case .driver:
+            gyro = GyroRuntime(profile.gyroSource == .left ? config.leftGyro : config.rightGyro)
+        case .contributor:
+            // Only reachable while fused: this half doesn't drive the cursor,
+            // but still has to sample and feed the fusion bus every tick,
+            // regardless of whether its own standalone gyro happens to be on.
+            var runtime = GyroRuntime(GyroConfig())
+            runtime.enabled = true
+            gyro = runtime
+        case .off:
+            gyro = GyroRuntime(GyroConfig())
         }
 
         return ActiveMapping(
             gyro: gyro,
             role: role,
-            buttons: profile.buttons,
+            // Buttons and sticks don't change with combine state — only which
+            // gyro drives the cursor does. See `CombineProfile`.
+            buttons: config.buttons,
             fn: combineState.fn,
-            leftStick: profile.leftStick,
-            rightStick: profile.rightStick,
-            leftStickRotation: combineState.leftStickRotation,
-            rightStickRotation: combineState.rightStickRotation,
+            leftStick: config.leftStick,
+            rightStick: config.rightStick,
             savedAlignment: profile.fusionAlignment,
             isCombined: true,
             isFused: profile.gyroSource == .fused
@@ -367,22 +375,22 @@ final class ControllerMapper {
         controller.leftStickPosHandler = { [weak self] pos in
             guard let self = self else { return }
             let mapping = self.mappingSnapshot()
-            self.handleStickPos(pos, stick: mapping.leftStick, rotation: mapping.leftStickRotation, isLeft: true)
+            self.handleStickPos(pos, stick: mapping.leftStick, rotation: self.activeStickRotation(mapping, isLeft: true), isLeft: true)
         }
         controller.rightStickPosHandler = { [weak self] pos in
             guard let self = self else { return }
             let mapping = self.mappingSnapshot()
-            self.handleStickPos(pos, stick: mapping.rightStick, rotation: mapping.rightStickRotation, isLeft: false)
+            self.handleStickPos(pos, stick: mapping.rightStick, rotation: self.activeStickRotation(mapping, isLeft: false), isLeft: false)
         }
         controller.leftStickHandler = { [weak self] newDir, oldDir in
             guard let self = self else { return }
             let mapping = self.mappingSnapshot()
-            self.handleStickDirection(newDir, oldDir, stick: mapping.leftStick, rotation: mapping.leftStickRotation, prefix: "lstick")
+            self.handleStickDirection(newDir, oldDir, stick: mapping.leftStick, rotation: self.activeStickRotation(mapping, isLeft: true), prefix: "lstick")
         }
         controller.rightStickHandler = { [weak self] newDir, oldDir in
             guard let self = self else { return }
             let mapping = self.mappingSnapshot()
-            self.handleStickDirection(newDir, oldDir, stick: mapping.rightStick, rotation: mapping.rightStickRotation, prefix: "rstick")
+            self.handleStickDirection(newDir, oldDir, stick: mapping.rightStick, rotation: self.activeStickRotation(mapping, isLeft: false), prefix: "rstick")
         }
         controller.sensorHandler = { [weak self] in self?.handleGyro() }
     }
@@ -525,6 +533,18 @@ final class ControllerMapper {
         }
     }
 
+    /// Rotate-to-switch is a property of *holding a specific FN key* (see
+    /// `FnLayer`), not a fixed setting, so it can't be resolved once into
+    /// `ActiveMapping` the way buttons and sticks are — it has to be looked
+    /// up fresh against whichever FN key (if any) is unambiguously engaged
+    /// right now. Two or more held at once is the same "no output" ambiguity
+    /// `FnConfig.action(for:base:engaged:)` already applies to buttons.
+    private func activeStickRotation(_ mapping: ActiveMapping, isLeft: Bool) -> StickRotationConfig {
+        let engaged = combine.fnEngagedKeys()
+        guard engaged.count == 1, let layer = mapping.fn.layer(forKey: engaged[0]) else { return StickRotationConfig() }
+        return isLeft ? layer.leftStickRotation : layer.rightStickRotation
+    }
+
     private func handleStickDirection(_ newDir: JoyCon.StickDirection, _ oldDir: JoyCon.StickDirection, stick: StickConfig, rotation: StickRotationConfig, prefix: String) {
         guard !isTestModeSuppressed else { return }
         // The rotation gesture sweeps through all four cardinal positions on
@@ -533,7 +553,10 @@ final class ControllerMapper {
         // FN key is held — otherwise a sweep would fire both a tab switch and
         // a burst of arrow keys. Outside that window Key mode plays normally.
         guard stick.mode == .key else { return }
-        if rotation.target != .off, !combine.fnEngagedKeys().isEmpty { return }
+        // `rotation` already reflects whether a specific, unambiguously
+        // engaged FN key configures this stick's rotation — see
+        // `activeStickRotation` — so this alone is the gate.
+        if rotation.target != .off { return }
         let oldSet = cardinals(for: oldDir)
         let newSet = cardinals(for: newDir)
 
@@ -565,8 +588,10 @@ final class ControllerMapper {
         // Gated on an FN key actually being held, not just on `rotation`
         // being configured — a bare circular sweep is common enough in
         // ordinary play (aiming, menu navigation) that firing on it alone
-        // misfires regularly. Requiring FN turns it into a deliberate gesture.
-        let active = rotation.target != .off && !combine.fnEngagedKeys().isEmpty
+        // misfires regularly. `rotation` is already resolved from whichever
+        // FN key is unambiguously engaged right now (see
+        // `activeStickRotation`), so a bare `.off` check is the whole gate.
+        let active = rotation.target != .off
 
         guard active else {
             // Mutually exclusive with the gesture: FN not held (or rotation
@@ -1132,11 +1157,6 @@ struct ActiveMapping {
     var fn: FnConfig = FnConfig()
     var leftStick: StickConfig = StickConfig()
     var rightStick: StickConfig = StickConfig()
-    /// Defaults to `.off` outside Combine, same as `fn` itself: the whole
-    /// gesture is gated on an FN key, which only exists once both halves are
-    /// connected — see `StickRotationConfig`.
-    var leftStickRotation: StickRotationConfig = StickRotationConfig()
-    var rightStickRotation: StickRotationConfig = StickRotationConfig()
     /// A calibration saved in the profile, if there is one. Its presence is
     /// what spares the user having to wave the grip about at every launch.
     var savedAlignment: FusionAlignment?

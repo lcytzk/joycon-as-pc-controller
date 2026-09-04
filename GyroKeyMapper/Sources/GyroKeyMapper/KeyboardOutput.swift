@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import QuartzCore
@@ -174,6 +175,16 @@ final class KeyboardOutput {
     }
 
     private func postKey(_ code: CGKeyCode, down: Bool, autorepeat: Bool = false) {
+        // Volume/mute aren't in the ordinary keyboard usage table CGEvent's
+        // virtual-keycode posting expects — real hardware reports them as a
+        // "system defined" consumer-key event instead (see `postMediaKey`).
+        // A keyDown/keyUp built from their Events.h keycode reaches a focused
+        // app's key handlers but never actually changes the volume.
+        if let nxKeyType = mediaKeyTypeByKeyCode[code] {
+            postMediaKey(nxKeyType, down: down)
+            return
+        }
+
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
         var flags = currentFlags()
         // Function keys and arrows carry the fn bit on real hardware, and global
@@ -182,6 +193,37 @@ final class KeyboardOutput {
         if functionGroupKeyCodes.contains(code) { flags.insert(.maskSecondaryFn) }
         event.flags = flags
         if autorepeat { event.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// `NX_KEYTYPE_*` from IOKit's hidsystem/ev_keymap.h — not exposed as a
+    /// Swift/CoreGraphics constant, so the raw values are named here instead.
+    private let mediaKeyTypeByKeyCode: [CGKeyCode: Int32] = {
+        var map: [CGKeyCode: Int32] = [:]
+        if let code = keyCodes["volumeup"] { map[code] = 0 }   // NX_KEYTYPE_SOUND_UP
+        if let code = keyCodes["volumedown"] { map[code] = 1 } // NX_KEYTYPE_SOUND_DOWN
+        if let code = keyCodes["mute"] { map[code] = 7 }       // NX_KEYTYPE_MUTE
+        return map
+    }()
+
+    /// The mechanism every volume-key remapper uses: a `.systemDefined` NSEvent
+    /// with subtype 8 encodes a consumer key (`nxKeyType`) and its down/up
+    /// state in `data1` — that's the shape HID posts for a real media key, and
+    /// the only shape CoreAudio's key handling actually watches for.
+    private func postMediaKey(_ nxKeyType: Int32, down: Bool) {
+        let modifierFlags = down ? 0xa00 : 0xb00
+        let data1 = (Int(nxKeyType) << 16) | (down ? 0xa : 0xb) << 8
+        guard let nsEvent = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(modifierFlags)),
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: data1,
+            data2: -1
+        ), let event = nsEvent.cgEvent else { return }
         event.post(tap: .cghidEventTap)
     }
 

@@ -33,16 +33,31 @@ struct FnLayer: Codable, Equatable {
     /// A name from `buttonNames`, or nil while none has been chosen.
     var key: String? = nil
     var bindings: [String: ButtonAction] = [:]
+    // Rotate-to-switch-tabs while holding *this* FN key — see
+    // `StickRotationConfig`. Lives per layer rather than globally: different
+    // FN keys routinely serve different purposes, so whether a stick sweep
+    // under one of them should mean "switch tabs" is that layer's own
+    // choice, not one shared across every FN key at once.
+    var leftStickRotation: StickRotationConfig = StickRotationConfig()
+    var rightStickRotation: StickRotationConfig = StickRotationConfig()
 
-    init(key: String? = nil, bindings: [String: ButtonAction] = [:]) {
+    init(
+        key: String? = nil, bindings: [String: ButtonAction] = [:],
+        leftStickRotation: StickRotationConfig = StickRotationConfig(),
+        rightStickRotation: StickRotationConfig = StickRotationConfig()
+    ) {
         self.key = key
         self.bindings = bindings
+        self.leftStickRotation = leftStickRotation
+        self.rightStickRotation = rightStickRotation
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         key = try container.decodeIfPresent(String.self, forKey: .key)
         bindings = try container.decodeIfPresent([String: ButtonAction].self, forKey: .bindings) ?? [:]
+        leftStickRotation = try container.decodeIfPresent(StickRotationConfig.self, forKey: .leftStickRotation) ?? StickRotationConfig()
+        rightStickRotation = try container.decodeIfPresent(StickRotationConfig.self, forKey: .rightStickRotation) ?? StickRotationConfig()
     }
 
     /// Pointed at an actual button. A half-finished layer must change nothing,
@@ -241,25 +256,17 @@ enum CombineGyroSource: String, Codable {
 /// that can differ between the two ways of holding them. `CombineMode` selects
 /// which profile is live; the other keeps its own values untouched.
 struct CombineProfile: Codable, Equatable {
-    // Independent from AppConfig's top-level `buttons`: both-at-once can want
-    // different bindings than either controller alone, and the two holding
-    // modes can want different bindings from each other.
-    var buttons: [String: ButtonAction] = [:]
-    // Same reasoning as `buttons`: a stick that is WASD when the halves are one
-    // per hand can want to be the mouse once they're in a grip. Joy-Con L
-    // reports as the left stick and Joy-Con R as the right, so the pair covers
-    // both halves with no overlap.
-    var leftStick: StickConfig = StickConfig()
-    var rightStick: StickConfig = StickConfig()
+    // Buttons, sticks, and gyro tuning are *not* duplicated here: AppConfig's
+    // top-level `buttons`/`leftStick`/`rightStick`/`leftGyro`/`rightGyro`
+    // apply whether or not the pair is combined, and fusing tunes as the
+    // right half's own gyro too (see `ControllerMapper.resolveMapping` —
+    // fusing's driver is always the right half). Keeping a second copy of any
+    // of this per holding mode meant every remap had to be repeated in up to
+    // three places (standalone, separate, grip) to keep working once both
+    // halves were connected — easy to forget, and the divergence was silent
+    // until something "stopped working" only when combined. All that's left
+    // to choose per holding mode is *which* gyro is even live.
     var gyroSource: CombineGyroSource = .right
-    var leftGyro: GyroConfig = GyroConfig()
-    var rightGyro: GyroConfig = GyroConfig()
-    // The single gyro the user sees while fusing: a complete config, describing
-    // the driving IMU exactly as a one-controller setup would. Where the second
-    // IMU's axes sit relative to these is learned at runtime by `GyroAlignment`
-    // rather than configured, so fusing asks nothing extra of the user.
-    // leftGyro/rightGyro apply to the single-side sources only.
-    var fused: GyroConfig = GyroConfig()
     // A saved answer to "how is the second IMU oriented relative to the first".
     // It's a property of two controllers in a grip, so it doesn't change
     // between sessions — storing it means the pair is ready to fuse the moment
@@ -267,52 +274,32 @@ struct CombineProfile: Codable, Equatable {
     // calibrated, in which case it is worked out live.
     var fusionAlignment: FusionAlignment? = nil
 
-    init(
-        buttons: [String: ButtonAction] = [:],
-        leftStick: StickConfig = StickConfig(),
-        rightStick: StickConfig = StickConfig(),
-        gyroSource: CombineGyroSource = .right,
-        leftGyro: GyroConfig = GyroConfig(),
-        rightGyro: GyroConfig = GyroConfig(),
-        fused: GyroConfig = GyroConfig(),
-        fusionAlignment: FusionAlignment? = nil
-    ) {
-        self.buttons = buttons
-        self.leftStick = leftStick
-        self.rightStick = rightStick
+    init(gyroSource: CombineGyroSource = .right, fusionAlignment: FusionAlignment? = nil) {
         self.gyroSource = gyroSource
-        self.leftGyro = leftGyro
-        self.rightGyro = rightGyro
-        self.fused = fused
         self.fusionAlignment = fusionAlignment
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        buttons = try container.decodeIfPresent([String: ButtonAction].self, forKey: .buttons) ?? [:]
-        leftStick = try container.decodeIfPresent(StickConfig.self, forKey: .leftStick) ?? StickConfig()
-        rightStick = try container.decodeIfPresent(StickConfig.self, forKey: .rightStick) ?? StickConfig()
         gyroSource = try container.decodeIfPresent(CombineGyroSource.self, forKey: .gyroSource) ?? .right
-        leftGyro = try container.decodeIfPresent(GyroConfig.self, forKey: .leftGyro) ?? GyroConfig()
-        rightGyro = try container.decodeIfPresent(GyroConfig.self, forKey: .rightGyro) ?? GyroConfig()
-        fused = try container.decodeIfPresent(GyroConfig.self, forKey: .fused) ?? GyroConfig()
         fusionAlignment = try container.decodeIfPresent(FusionAlignment.self, forKey: .fusionAlignment)
     }
 }
 
-// Settings that apply only when both Joy-Cons are connected at once — one
+// Gyro settings that apply only when both Joy-Cons are connected at once — one
 // profile per holding mode, plus which of them is selected. While both halves
-// are present these take over from the per-side settings entirely: see
-// `CombineCoordinator` and `ControllerMapper.resolveMapping`.
+// are present these take over from the per-side gyro settings; buttons and
+// sticks are unaffected by combine state at all — see `CombineCoordinator`
+// and `ControllerMapper.resolveMapping`.
 struct CombineConfig: Codable, Equatable {
     var mode: CombineMode = .separate
     // Shared by both holding modes rather than living inside a profile: it has
     // its own settings tab, outside the mode switch, because an FN combination
     // spans both halves and isn't a property of how the pair is held.
+    // Rotate-to-switch lives on each `FnLayer` itself now (see
+    // `StickRotationConfig`), not here — it's a property of holding a
+    // specific FN key, not of the combine config as a whole.
     var fn: FnConfig = FnConfig()
-    // Same reasoning as `fn`, and gated by it: see `StickRotationConfig`.
-    var leftStickRotation: StickRotationConfig = StickRotationConfig()
-    var rightStickRotation: StickRotationConfig = StickRotationConfig()
     var separate: CombineProfile = CombineProfile()
     var grip: CombineProfile = CombineProfile()
 
@@ -329,14 +316,10 @@ struct CombineConfig: Codable, Equatable {
 
     init(
         mode: CombineMode = .separate, fn: FnConfig = FnConfig(),
-        leftStickRotation: StickRotationConfig = StickRotationConfig(),
-        rightStickRotation: StickRotationConfig = StickRotationConfig(),
         separate: CombineProfile = CombineProfile(), grip: CombineProfile = CombineProfile()
     ) {
         self.mode = mode
         self.fn = fn
-        self.leftStickRotation = leftStickRotation
-        self.rightStickRotation = rightStickRotation
         self.separate = separate
         self.grip = grip
         normalize()
@@ -346,8 +329,6 @@ struct CombineConfig: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         mode = try container.decodeIfPresent(CombineMode.self, forKey: .mode) ?? .separate
         fn = try container.decodeIfPresent(FnConfig.self, forKey: .fn) ?? FnConfig()
-        leftStickRotation = try container.decodeIfPresent(StickRotationConfig.self, forKey: .leftStickRotation) ?? StickRotationConfig()
-        rightStickRotation = try container.decodeIfPresent(StickRotationConfig.self, forKey: .rightStickRotation) ?? StickRotationConfig()
         separate = try container.decodeIfPresent(CombineProfile.self, forKey: .separate) ?? CombineProfile()
         grip = try container.decodeIfPresent(CombineProfile.self, forKey: .grip) ?? CombineProfile()
         normalize()
@@ -501,8 +482,6 @@ enum KeyValueConfigCodec {
 
         lines.append("combine.mode=\(config.combine.mode.rawValue)")
         encodeFn(config.combine.fn, prefix: "combine.fn", into: &lines)
-        encodeStickRotation(config.combine.leftStickRotation, prefix: "combine.rotation.left", into: &lines)
-        encodeStickRotation(config.combine.rightStickRotation, prefix: "combine.rotation.right", into: &lines)
         encodeCombineProfile(config.combine.separate, prefix: "combine.separate", into: &lines)
         encodeCombineProfile(config.combine.grip, prefix: "combine.grip", into: &lines)
 
@@ -530,13 +509,7 @@ enum KeyValueConfigCodec {
     }
 
     private static func encodeCombineProfile(_ profile: CombineProfile, prefix: String, into lines: inout [String]) {
-        encodeButtons(profile.buttons, prefix: "\(prefix).button", into: &lines)
-        encodeStick(profile.leftStick, prefix: "\(prefix).stick.left", into: &lines)
-        encodeStick(profile.rightStick, prefix: "\(prefix).stick.right", into: &lines)
         lines.append("\(prefix).gyroSource=\(profile.gyroSource.rawValue)")
-        encodeGyro(profile.leftGyro, prefix: "\(prefix).gyro.left", into: &lines)
-        encodeGyro(profile.rightGyro, prefix: "\(prefix).gyro.right", into: &lines)
-        encodeGyro(profile.fused, prefix: "\(prefix).gyro.fused", into: &lines)
         if let alignment = profile.fusionAlignment, !alignment.isEmpty {
             lines.append("\(prefix).fusion=\(alignment.textForm)")
         }
@@ -544,44 +517,23 @@ enum KeyValueConfigCodec {
 
     private static func decodeCombineProfile(prefix: String, from values: [String: String]) -> CombineProfile {
         CombineProfile(
-            buttons: decodeButtons(prefix: "\(prefix).button", from: values),
-            leftStick: decodeStick(prefix: "\(prefix).stick.left", from: values),
-            rightStick: decodeStick(prefix: "\(prefix).stick.right", from: values),
             gyroSource: values["\(prefix).gyroSource"].flatMap(CombineGyroSource.init(rawValue:)) ?? .right,
-            leftGyro: decodeGyro(prefix: "\(prefix).gyro.left", from: values),
-            rightGyro: decodeGyro(prefix: "\(prefix).gyro.right", from: values),
-            fused: decodeGyro(prefix: "\(prefix).gyro.fused", from: values),
             fusionAlignment: values["\(prefix).fusion"].flatMap(FusionAlignment.init(textForm:))
         )
     }
 
-    /// Files written before combine settings were split per holding mode carry
-    /// a single unprefixed `combine.*` block. It describes whichever mode was
-    /// selected at the time, so it migrates into that profile and leaves the
-    /// other one at its defaults — rather than being dropped, which would
-    /// silently discard a mapping the user had already tuned.
+    /// Older files carried buttons, sticks, per-side/fused gyro tuning, and a
+    /// pair of global `combine.rotation.left`/`.right` settings that don't
+    /// exist on `CombineConfig`/`CombineProfile` any more (a single unprefixed
+    /// `combine.*` block predating even the mode split, or a
+    /// `combine.separate.`/`combine.grip.` one predating this simplification)
+    /// — those settings are simply whatever the top-level `button.*`/
+    /// `gyro.*` blocks (and, for rotation, each FN layer) already say, same
+    /// as any other setting an older or newer build doesn't recognize.
     private static func decodeCombine(from values: [String: String]) -> CombineConfig {
-        let mode = values["combine.mode"].flatMap(CombineMode.init(rawValue:)) ?? .separate
-        let hasProfiles = values.keys.contains { $0.hasPrefix("combine.separate.") || $0.hasPrefix("combine.grip.") }
-        guard hasProfiles else {
-            var combine = CombineConfig(
-                mode: mode,
-                fn: decodeFn(prefix: "combine.fn", from: values),
-                leftStickRotation: decodeStickRotation(prefix: "combine.rotation.left", from: values),
-                rightStickRotation: decodeStickRotation(prefix: "combine.rotation.right", from: values)
-            )
-            combine[mode] = CombineProfile(
-                buttons: decodeButtons(prefix: "combine.button", from: values),
-                leftGyro: decodeGyro(prefix: "combine.gyro.left", from: values),
-                rightGyro: decodeGyro(prefix: "combine.gyro.right", from: values)
-            )
-            return combine
-        }
-        return CombineConfig(
-            mode: mode,
+        CombineConfig(
+            mode: values["combine.mode"].flatMap(CombineMode.init(rawValue:)) ?? .separate,
             fn: decodeFn(prefix: "combine.fn", from: values),
-            leftStickRotation: decodeStickRotation(prefix: "combine.rotation.left", from: values),
-            rightStickRotation: decodeStickRotation(prefix: "combine.rotation.right", from: values),
             separate: decodeCombineProfile(prefix: "combine.separate", from: values),
             grip: decodeCombineProfile(prefix: "combine.grip", from: values)
         )
@@ -625,6 +577,12 @@ enum KeyValueConfigCodec {
             let layerPrefix = "\(prefix).\(index)"
             if let key = layer.key, !key.isEmpty { lines.append("\(layerPrefix).key=\(key)") }
             encodeButtons(layer.bindings, prefix: "\(layerPrefix).button", into: &lines)
+            if layer.leftStickRotation.target != .off {
+                encodeStickRotation(layer.leftStickRotation, prefix: "\(layerPrefix).rotation.left", into: &lines)
+            }
+            if layer.rightStickRotation.target != .off {
+                encodeStickRotation(layer.rightStickRotation, prefix: "\(layerPrefix).rotation.right", into: &lines)
+            }
         }
     }
 
@@ -642,7 +600,9 @@ enum KeyValueConfigCodec {
             let layerPrefix = "\(prefix).\(index)"
             let layer = FnLayer(
                 key: values["\(layerPrefix).key"],
-                bindings: decodeButtons(prefix: "\(layerPrefix).button", from: values)
+                bindings: decodeButtons(prefix: "\(layerPrefix).button", from: values),
+                leftStickRotation: decodeStickRotation(prefix: "\(layerPrefix).rotation.left", from: values),
+                rightStickRotation: decodeStickRotation(prefix: "\(layerPrefix).rotation.right", from: values)
             )
             // A stored layer with neither a key nor a binding is noise.
             return (layer.isConfigured || !layer.bindings.isEmpty) ? layer : nil
