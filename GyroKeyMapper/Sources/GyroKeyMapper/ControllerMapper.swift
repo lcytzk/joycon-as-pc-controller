@@ -86,6 +86,8 @@ final class ControllerMapper {
         session.reset()
         leftRotationTracker.reset()
         rightRotationTracker.reset()
+        leftHeldRotationKey = nil
+        rightHeldRotationKey = nil
         inputLock.unlock()
     }
 
@@ -103,6 +105,8 @@ final class ControllerMapper {
         session.reset()
         leftRotationTracker.reset()
         rightRotationTracker.reset()
+        leftHeldRotationKey = nil
+        rightHeldRotationKey = nil
         inputLock.unlock()
         // The learned placement of the other IMU is relative to *these* axis
         // choices, so choosing again throws it away rather than carrying a
@@ -122,6 +126,12 @@ final class ControllerMapper {
                 gyro: GyroRuntime(isLeft ? config.leftGyro : config.rightGyro),
                 role: .driver,
                 buttons: config.buttons,
+                // FN doesn't require both halves — a lone Joy-Con can hold its
+                // own FN key and drive its own stick's rotation layer. `combine`
+                // already tracks this config and its hold-state independent of
+                // `isCombined` (see `CombineCoordinator`), so it's just a matter
+                // of not discarding it here.
+                fn: combineState.fn,
                 leftStick: config.leftStick,
                 rightStick: config.rightStick
             )
@@ -330,6 +340,15 @@ final class ControllerMapper {
     /// the IOHID thread, reset from whatever thread applies a config change.
     private var leftRotationTracker = StickRotationTracker()
     private var rightRotationTracker = StickRotationTracker()
+
+    /// The combo actually pressed for the held side of an in-progress rotation
+    /// gesture, captured at press time. Releasing it later must replay this
+    /// same string rather than re-deriving `rotation.target.heldKeyName` from
+    /// whatever the config resolves to *now* — if the release is provoked by
+    /// FN letting go, that fresh lookup has already flipped to `.off`, whose
+    /// `heldKeyName` is empty and releases nothing, leaving the real key stuck.
+    private var leftHeldRotationKey: String?
+    private var rightHeldRotationKey: String?
 
     init(controller: JoyConSwift.Controller, config: AppConfig, combine: CombineCoordinator) {
         self.controller = controller
@@ -580,11 +599,6 @@ final class ControllerMapper {
         }
 
         let holdIdentifier = outputKey(isLeft ? "lstick.rotate.hold" : "rstick.rotate.hold")
-        // Constant for the duration of one unchanged config, so it's safe to
-        // use for both press and release below — a config change that swaps
-        // this mid-gesture already goes through `refreshMapping`'s blanket
-        // `releaseAll` first, which clears `engaged` before this runs again.
-        let heldKey = rotation.target.heldKeyName
         // Gated on an FN key actually being held, not just on `rotation`
         // being configured — a bare circular sweep is common enough in
         // ordinary play (aiming, menu navigation) that firing on it alone
@@ -621,11 +635,21 @@ final class ControllerMapper {
 
             inputLock.lock()
             let wasEngaged = isLeft ? leftRotationTracker.engaged : rightRotationTracker.engaged
-            if isLeft { leftRotationTracker.reset() } else { rightRotationTracker.reset() }
+            // `rotation` is `.off` here — that's what put us in this branch —
+            // so the key to release has to come from what press actually used,
+            // not from re-deriving it off the now-stale config.
+            let heldKey = isLeft ? leftHeldRotationKey : rightHeldRotationKey
+            if isLeft {
+                leftRotationTracker.reset()
+                leftHeldRotationKey = nil
+            } else {
+                rightRotationTracker.reset()
+                rightHeldRotationKey = nil
+            }
             inputLock.unlock()
             // Off (or FN let go, or the stick recentered right as either
             // happened) mid-gesture — the held key must not outlive it.
-            if wasEngaged { KeyboardOutput.shared.release(heldKey, identifier: holdIdentifier) }
+            if wasEngaged, let heldKey = heldKey { KeyboardOutput.shared.release(heldKey, identifier: holdIdentifier) }
             // Published even with the gesture inactive, so the settings
             // window can confirm raw stick input is arriving before FN is
             // even held.
@@ -633,12 +657,19 @@ final class ControllerMapper {
             return
         }
 
+        let heldKey = rotation.target.heldKeyName
+
         inputLock.lock()
         let wasEngaged = isLeft ? leftRotationTracker.engaged : rightRotationTracker.engaged
         let steps = isLeft
             ? leftRotationTracker.update(pos: pos, degreesPerStep: rotation.degreesPerStep)
             : rightRotationTracker.update(pos: pos, degreesPerStep: rotation.degreesPerStep)
         let nowEngaged = isLeft ? leftRotationTracker.engaged : rightRotationTracker.engaged
+        if nowEngaged && !wasEngaged {
+            if isLeft { leftHeldRotationKey = heldKey } else { rightHeldRotationKey = heldKey }
+        } else if wasEngaged && !nowEngaged {
+            if isLeft { leftHeldRotationKey = nil } else { rightHeldRotationKey = nil }
+        }
         inputLock.unlock()
         publishStickDebug(isLeft: isLeft, x: Double(pos.x), y: Double(pos.y), addedSteps: abs(steps))
 

@@ -304,8 +304,7 @@ final class AppController: NSObject {
                 learned: driver?.learnedAlignment ?? FusionAlignment()
             )
             self.settingsWindowController?.updateFnState(
-                engaged: self.combine.fnEngagedKeys().last,
-                combined: self.isCombined()
+                engaged: self.combine.fnEngagedKeys().last
             )
             let leftMapper = self.mappers.values.first { $0.controller.type == .JoyConL }
             let rightMapper = self.mappers.values.first { $0.controller.type == .JoyConR }

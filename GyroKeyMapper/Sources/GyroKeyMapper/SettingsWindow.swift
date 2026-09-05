@@ -440,7 +440,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         fnControls.liveLabel.preferredMaxLayoutWidth = 460
         fnControls.liveLabel.widthAnchor.constraint(equalToConstant: 460).isActive = true
         body.addArrangedSubview(fnControls.liveLabel)
-        updateFnState(engaged: nil, combined: false)
+        updateFnState(engaged: nil)
 
         mainStack.addArrangedSubview(body)
         return mainStack
@@ -1625,15 +1625,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// page is open and it says so — which separates "the hold didn't register"
     /// from "the binding didn't apply", the two things that look identical from
     /// the outside.
-    func updateFnState(engaged: String?, combined: Bool) {
+    func updateFnState(engaged: String?) {
         if let engaged = engaged {
             fnControls.liveLabel.stringValue = "● Holding \(engaged) — its combinations are live right now."
             fnControls.liveLabel.textColor = .systemGreen
-        } else if combined {
-            fnControls.liveLabel.stringValue = "Hold an FN key on the controller and this line will say so."
-            fnControls.liveLabel.textColor = .secondaryLabelColor
         } else {
-            fnControls.liveLabel.stringValue = "Connect both Joy-Cons to try an FN key."
+            fnControls.liveLabel.stringValue = "Hold an FN key on a connected controller and this line will say so."
             fnControls.liveLabel.textColor = .secondaryLabelColor
         }
     }
@@ -1694,13 +1691,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             combineStatusLabel.textColor = .secondaryLabelColor
         }
 
-        // FN only exists in combined operation, so the page says so plainly
-        // rather than letting someone configure it and find it inert.
-        if leftConnected && rightConnected {
-            fnControls.statusLabel.stringValue = "● Both Joy-Cons connected — FN keys are in effect."
+        // FN works on either a lone half or a combined pair, so the page just
+        // says whether anything is connected to try it on.
+        if leftConnected || rightConnected {
+            fnControls.statusLabel.stringValue = "● FN keys are in effect."
             fnControls.statusLabel.textColor = .systemGreen
         } else {
-            fnControls.statusLabel.stringValue = "○ FN keys only apply while both Joy-Cons are connected — a combination normally spans the two halves. Nothing here affects a single controller."
+            fnControls.statusLabel.stringValue = "○ Connect a Joy-Con to try an FN key."
             fnControls.statusLabel.textColor = .secondaryLabelColor
         }
     }
